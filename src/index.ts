@@ -58,6 +58,7 @@ import { startOllamaBridge, stopOllamaBridge } from "./ollama/server.js";
 import { createOfficialAgentRoutes } from "./routes/official-agent.js";
 import { installUncaughtErrorHandlers } from "./logs/error-log.js";
 import { awaitServerListening } from "./utils/await-listening.js";
+import { RequestArchive } from "./archive/request-archive.js";
 
 export interface ServerHandle {
   close: () => Promise<void>;
@@ -193,21 +194,22 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   // Last-resort upstream apikey (single, Responses API wire). Used only when
   // every OAuth account is unavailable.
   const fallbackUpstreamStore = new FallbackUpstreamStore();
+  const requestArchive = new RequestArchive({ enabled: config.archive.enabled });
 
   // Mount routes
   const authRoutes = createAuthRoutes(accountPool, refreshScheduler);
   const accountRoutes = createAccountRoutes(accountPool, refreshScheduler, cookieJar, proxyPool, fallbackUpstreamStore);
-  const chatRoutes = createChatRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
+  const chatRoutes = createChatRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
   const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
   const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
-  const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
+  const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
   const imagesRoutes = createImagesRoutes(accountPool, cookieJar, proxyPool, clientKeyPool);
   const apiKeyRoutes = createApiKeyRoutes(apiKeyPool, apiKeyModelCache, memoStore);
   const embeddingsRoutes = createEmbeddingsRoutes(accountPool, apiKeyPool, clientKeyPool);
   const proxyRoutes = createProxyRoutes(proxyPool, accountPool);
   const usageStats = new UsageStatsStore();
   usageStats.recoverBaseline(accountPool);
-  const webRoutes = createWebRoutes(accountPool, usageStats, clientKeyPool);
+  const webRoutes = createWebRoutes(accountPool, usageStats, clientKeyPool, requestArchive);
 
   app.route("/", createDashboardAuthRoutes());
   app.route("/", authRoutes);

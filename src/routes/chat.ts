@@ -29,6 +29,7 @@ import { summarizeRequestForLog } from "../logs/request-summary.js";
 import { apiKeyAuth } from "../middleware/api-key-auth.js";
 import type { ClientKeyPool } from "../auth/client-key-pool.js";
 import type { FallbackUpstreamStore } from "../auth/fallback-upstream.js";
+import type { RequestArchive } from "../archive/request-archive.js";
 import { validateClientKeyModel } from "./shared/proxy-handler-utils.js";
 import { resolveDefaultTools, mergeDefaultTools } from "./shared/default-tools.js";
 import { X_OPENCODE_SESSION_HEADER } from "../proxy/opencode-headers.js";
@@ -105,6 +106,7 @@ export function createChatRoutes(
   upstreamRouter?: UpstreamRouter,
   clientKeyPool?: ClientKeyPool,
   fallbackUpstream?: FallbackUpstreamStore,
+  requestArchive?: RequestArchive,
 ): Hono {
   const app = new Hono();
 
@@ -216,10 +218,10 @@ export function createChatRoutes(
 
     const summary = accountPool.getPoolSummary();
     if (summary.active === 0) {
-      return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream });
+      return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream, requestArchive, archiveRequestBody: req, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
     }
 
-    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream });
+    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream, requestArchive, archiveRequestBody: req, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
   });
 
   return app;

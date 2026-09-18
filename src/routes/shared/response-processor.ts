@@ -51,6 +51,7 @@ export interface StreamResponseOptions {
   usageHint?: UsageHint;
   onResponseMetadata?: (metadata: ResponseMetadata) => void;
   onFirstToken?: (timestampMs: number) => void;
+  onChunk?: (chunk: string) => void;
   diagnostics?: StreamDiagnostics;
   /** Idle heartbeat cadence in ms. A SSE comment line is written whenever no
    *  real chunk has been forwarded for this long, keeping tunnels (ngrok /
@@ -147,6 +148,7 @@ export async function streamResponse(options: StreamResponseOptions): Promise<vo
         sawFirstToken = true;
         options.onFirstToken?.(Date.now());
       }
+      options.onChunk?.(chunk);
       const chunkTrace = inspectStreamChunk(chunk);
       if (debugDumpEnabled()) {
         debugDump("upstream-chunk", {

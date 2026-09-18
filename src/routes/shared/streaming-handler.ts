@@ -18,6 +18,8 @@ import { getReasoningReplayCache } from "../../proxy/reasoning-replay-cache.js";
 import { getWsPool } from "../../proxy/ws-pool.js";
 import { forwardCodexRateLimitHeaders } from "./codex-rate-limit-response-headers.js";
 import { relayCodexTurnState } from "./codex-turn-state.js";
+import type { RequestArchive } from "../../archive/request-archive.js";
+import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 export interface HandleStreamingOptions {
   c: Context;
@@ -48,6 +50,11 @@ export interface HandleStreamingOptions {
    *  initialEntryId). Used to badge the client-abort close event consistent
    *  with the main egress line. */
   fallback?: boolean;
+  /** Monotonic upstream-attempt number within this client request. */
+  attemptNumber?: number;
+  requestArchive?: RequestArchive;
+  archiveRequestBody?: unknown;
+  archiveRequestHeaders?: Record<string, string>;
 }
 
 export function handleStreaming(options: HandleStreamingOptions): Response {
@@ -70,6 +77,10 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
     chainAdvanceTicket,
     implicitResumeActive = false,
     fallback = false,
+    attemptNumber = 1,
+    requestArchive,
+    archiveRequestBody,
+    archiveRequestHeaders = {},
   } = options;
 
   c.header("Content-Type", "text/event-stream");
@@ -91,6 +102,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
   let capturedResponseId: string | null = null;
   let responseCompleted = false;
   let streamCompletedWithoutError = false;
+  const capturedChunks: string[] = [];
   const metadataCollector = createResponseMetadataCollector();
   const reasoningReplayCache = getReasoningReplayCache();
 
@@ -172,6 +184,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         onFirstToken: (ts) => {
           firstTokenMs = ts;
         },
+        onChunk: (chunk) => capturedChunks.push(chunk),
         usageHint,
         onResponseMetadata: (metadata) => {
           metadataCollector.onResponseMetadata(metadata);
@@ -192,7 +205,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         },
       });
       streamFailed = false;
-      streamCompletedWithoutError = true;
+      streamCompletedWithoutError = responseCompleted && !clientAborted;
     } finally {
       if (streamFailed && !clientAborted && !abortController.signal.aborted) {
         abortController.abort();
@@ -222,6 +235,40 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         );
       }
       if (streamCompletedWithoutError) clearCfChallengeCooldown(capturedEntryId);
+      if (streamCompletedWithoutError && requestArchive) {
+        const attemptId = `${requestId}:${attemptNumber}:${capturedEntryId}`;
+        const event: KeeperEvent = {
+          schema: KEEPER_EVENT_SCHEMA,
+          event_id: attemptId,
+          event_type: "request.completed",
+          occurred_at: new Date().toISOString(),
+          request_id: requestId,
+          attempt_id: attemptId,
+          account_entry_id: capturedEntryId,
+          provider: "codex",
+          endpoint: "/codex/responses",
+          model: req.model,
+          status_code: 200,
+          failed: false,
+          fallback,
+          latency_ms: null,
+          ttft_ms: firstTokenMs === null ? null : firstTokenMs - streamStartMs,
+          usage: usageInfo ?? null,
+          error_code: null,
+          error_message: null,
+        };
+        try {
+          requestArchive.recordCompleted({
+            event,
+            requestHeaders: archiveRequestHeaders,
+            requestBody: archiveRequestBody ?? req.codexRequest,
+            responseHeaders: Object.fromEntries(response.headers.entries()),
+            responseBody: capturedChunks.join(""),
+          });
+        } catch (archiveErr) {
+          console.warn(`[archive] failed to persist completed stream ${requestId}:`, archiveErr);
+        }
+      }
       if (usageInfo) {
         recordClientKeyUsage(c, req.model, usageInfo);
         logProxyUsage({

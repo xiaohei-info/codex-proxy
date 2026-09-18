@@ -9,6 +9,7 @@ import type { UsageInfo } from "../../translation/codex-event-extractor.js";
 import type { StreamCloseContextBase } from "../../logs/stream-close-event.js";
 import type { ReasoningReplayItem } from "../../proxy/reasoning-replay-cache.js";
 import type { FallbackUpstreamStore } from "../../auth/fallback-upstream.js";
+import type { RequestArchive } from "../../archive/request-archive.js";
 
 export interface StreamTranslatorContext extends StreamCloseContextBase {
   /** Request abort signal so format-specific translators can distinguish a
@@ -107,6 +108,11 @@ export interface HandleProxyRequestOptions {
   proxyPool?: ProxyPool;
   /** Optional last-resort upstream apikey used when no account is available. */
   fallbackUpstream?: FallbackUpstreamStore;
+  /** Optional completed-request archive; disabled by default. */
+  requestArchive?: RequestArchive;
+  /** Original client request data retained only for completed archive writes. */
+  archiveRequestBody?: unknown;
+  archiveRequestHeaders?: Record<string, string>;
 }
 
 export interface HandleDirectRequestOptions {

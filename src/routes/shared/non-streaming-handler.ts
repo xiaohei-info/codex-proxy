@@ -28,6 +28,8 @@ import { relayCodexTurnState } from "./codex-turn-state.js";
 import { recordClientKeyUsage } from "./proxy-handler-utils.js";
 import { updateLogEntry } from "../../logs/entry.js";
 import { calculateLogMetrics } from "../../logs/metrics.js";
+import type { RequestArchive } from "../../archive/request-archive.js";
+import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 
 const MAX_EMPTY_RETRIES = 2;
@@ -54,6 +56,9 @@ export interface HandleNonStreamingOptions {
   setActiveAccount?: (entryId: string, api: CodexApi) => void;
   variantHash?: string;
   chainAdvanceTicket?: ChainAdvanceTicket;
+  requestArchive?: RequestArchive;
+  archiveRequestBody?: unknown;
+  archiveRequestHeaders?: Record<string, string>;
 }
 
 export async function handleNonStreaming(options: HandleNonStreamingOptions): Promise<Response> {
@@ -79,6 +84,9 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
     setActiveAccount,
     variantHash,
     chainAdvanceTicket,
+    requestArchive,
+    archiveRequestBody,
+    archiveRequestHeaders = {},
   } = options;
   let currentEntryId = initialEntryId;
   let currentApi = initialApi;
@@ -106,6 +114,39 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
         },
       });
       const { result, responseFunctionCallIds, reasoningReplayItems } = collected;
+      if (requestArchive) {
+        const event: KeeperEvent = {
+          schema: KEEPER_EVENT_SCHEMA,
+          event_id: `${requestId}:${currentEntryId}:${attempt}`,
+          event_type: "request.completed",
+          occurred_at: new Date().toISOString(),
+          request_id: requestId,
+          attempt_id: `${requestId}:${currentEntryId}:${attempt}`,
+          account_entry_id: currentEntryId,
+          provider: "codex",
+          endpoint: "/codex/responses",
+          model: req.model,
+          status_code: 200,
+          failed: false,
+          fallback: currentEntryId !== initialEntryId,
+          latency_ms: Date.now() - initialStartMs,
+          ttft_ms: null,
+          usage: result.usage ?? null,
+          error_code: null,
+          error_message: null,
+        };
+        try {
+          requestArchive.recordCompleted({
+            event,
+            requestHeaders: archiveRequestHeaders,
+            requestBody: archiveRequestBody ?? req.codexRequest,
+            responseHeaders: Object.fromEntries(currentRawResponse.headers.entries()),
+            responseBody: result.response,
+          });
+        } catch (archiveErr) {
+          console.warn(`[archive] failed to persist completed response ${requestId}:`, archiveErr);
+        }
+      }
       recordNonStreamingSuccessAffinity({
         affinityMap,
         responseId: result.responseId,

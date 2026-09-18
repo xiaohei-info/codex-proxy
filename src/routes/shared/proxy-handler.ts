@@ -332,7 +332,9 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
       poolKeySuffix: recoveryWsKeySuffix,
     });
 
+  let attempt = 0;
   for (;;) {
+    attempt += 1;
     try {
       const { rawResponse, upstreamTurnState } = await sendProxyUpstreamAttempt({
         accountPool,
@@ -371,6 +373,10 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
           chainAdvanceTicket,
           implicitResumeActive: implicitResume.isActive(),
           fallback: entryId !== initialEntryId,
+          attemptNumber: attempt,
+          requestArchive: options.requestArchive,
+          archiveRequestBody: options.archiveRequestBody,
+          archiveRequestHeaders: options.archiveRequestHeaders,
         });
       }
 
@@ -401,6 +407,9 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
         },
         variantHash: sessionContext.variantHash,
         chainAdvanceTicket,
+        requestArchive: options.requestArchive,
+        archiveRequestBody: options.archiveRequestBody,
+        archiveRequestHeaders: options.archiveRequestHeaders,
       });
     } catch (err) {
       invalidateRejectedPreviousResponse({
