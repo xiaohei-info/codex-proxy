@@ -40,6 +40,12 @@ export function sanitizeArchiveHeaders(headers: Record<string, string>): Record<
   return Object.fromEntries(Object.entries(headers).filter(([name]) => !SENSITIVE_HEADER.test(name)));
 }
 
+/** Keep diagnostic failures bounded and free of likely credential-bearing payloads. */
+export function sanitizeArchiveErrorMessage(value: unknown): string {
+  const message = value instanceof Error ? value.message : String(value);
+  return message.replace(/(?:bearer\s+|token|secret|password|api[-_]?key)[^\s,;]*/gi, "[redacted]").slice(0, 500);
+}
+
 export interface CompletedRequestArchive {
   event: KeeperEvent;
   requestHeaders: Record<string, string>;
@@ -70,6 +76,16 @@ export class RequestArchive {
   }
 
   isEnabled(): boolean { return this.enabled; }
+
+  recordFailed(event: KeeperEvent): void {
+    if (!this.enabled) return;
+    const db = this.open();
+    if (!db) return;
+    db.prepare(`
+      INSERT OR IGNORE INTO integration_events (event_id, event_json, created_at)
+      VALUES (?, ?, ?)
+    `).run(event.event_id, JSON.stringify(event), new Date().toISOString());
+  }
 
   recordCompleted(request: CompletedRequestArchive): void {
     if (!this.enabled) return;

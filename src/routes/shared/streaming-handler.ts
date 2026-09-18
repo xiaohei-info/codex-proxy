@@ -18,7 +18,7 @@ import { getReasoningReplayCache } from "../../proxy/reasoning-replay-cache.js";
 import { getWsPool } from "../../proxy/ws-pool.js";
 import { forwardCodexRateLimitHeaders } from "./codex-rate-limit-response-headers.js";
 import { relayCodexTurnState } from "./codex-turn-state.js";
-import type { RequestArchive } from "../../archive/request-archive.js";
+import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 export interface HandleStreamingOptions {
@@ -103,6 +103,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
   let responseCompleted = false;
   let streamCompletedWithoutError = false;
   const capturedChunks: string[] = [];
+  let streamError: unknown = null;
   const metadataCollector = createResponseMetadataCollector();
   const reasoningReplayCache = getReasoningReplayCache();
 
@@ -184,7 +185,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         onFirstToken: (ts) => {
           firstTokenMs = ts;
         },
-        onChunk: (chunk) => capturedChunks.push(chunk),
+        onChunk: (chunk) => { if (requestArchive?.isEnabled()) capturedChunks.push(chunk); },
         usageHint,
         onResponseMetadata: (metadata) => {
           metadataCollector.onResponseMetadata(metadata);
@@ -206,6 +207,9 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
       });
       streamFailed = false;
       streamCompletedWithoutError = responseCompleted && !clientAborted;
+    } catch (err) {
+      streamError = err;
+      throw err;
     } finally {
       if (streamFailed && !clientAborted && !abortController.signal.aborted) {
         abortController.abort();
@@ -235,6 +239,20 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         );
       }
       if (streamCompletedWithoutError) clearCfChallengeCooldown(capturedEntryId);
+      if (!streamCompletedWithoutError && !clientAborted && requestArchive) {
+        const attemptId = `${requestId}:${attemptNumber}:${capturedEntryId}`;
+        const event: KeeperEvent = {
+          schema: KEEPER_EVENT_SCHEMA, event_id: `${attemptId}:failed`, event_type: "request.failed",
+          occurred_at: new Date().toISOString(), request_id: requestId, attempt_id: attemptId,
+          account_entry_id: capturedEntryId, provider: "codex", endpoint: "/codex/responses", model: req.model,
+          status_code: null, failed: true, fallback, latency_ms: Date.now() - streamStartMs,
+          ttft_ms: firstTokenMs === null ? null : firstTokenMs - streamStartMs, usage: null,
+          error_code: null, error_message: sanitizeArchiveErrorMessage(streamError),
+        };
+        try { requestArchive.recordFailed(event); } catch (archiveErr) {
+          console.warn(`[archive] failed to persist failed stream ${requestId}:`, archiveErr);
+        }
+      }
       if (streamCompletedWithoutError && requestArchive) {
         const attemptId = `${requestId}:${attemptNumber}:${capturedEntryId}`;
         const event: KeeperEvent = {

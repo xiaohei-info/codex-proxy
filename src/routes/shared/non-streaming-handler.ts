@@ -28,7 +28,7 @@ import { relayCodexTurnState } from "./codex-turn-state.js";
 import { recordClientKeyUsage } from "./proxy-handler-utils.js";
 import { updateLogEntry } from "../../logs/entry.js";
 import { calculateLogMetrics } from "../../logs/metrics.js";
-import type { RequestArchive } from "../../archive/request-archive.js";
+import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 
@@ -92,6 +92,24 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
   let currentApi = initialApi;
   let currentRawResponse = initialResponse;
   const initialStartMs = Date.now();
+  const recordFailure = (err: unknown, attemptNumber: number): void => {
+    if (!requestArchive || abortController.signal.aborted) return;
+    const status = err instanceof CodexApiError ? err.status : null;
+    const message = sanitizeArchiveErrorMessage(err);
+    const errorCode = err instanceof CodexApiError ? (() => {
+      try { const parsed = JSON.parse(err.body) as { code?: unknown; error?: { code?: unknown } }; return typeof parsed.code === "string" ? parsed.code : typeof parsed.error?.code === "string" ? parsed.error.code : null; } catch { return null; }
+    })() : null;
+    try {
+      requestArchive.recordFailed({
+        schema: KEEPER_EVENT_SCHEMA, event_id: `${requestId}:${currentEntryId}:${attemptNumber}:failed`,
+        event_type: "request.failed", occurred_at: new Date().toISOString(), request_id: requestId,
+        attempt_id: `${requestId}:${currentEntryId}:${attemptNumber}`, account_entry_id: currentEntryId,
+        provider: "codex", endpoint: "/codex/responses", model: req.model, status_code: status,
+        failed: true, fallback: currentEntryId !== initialEntryId, latency_ms: Date.now() - initialStartMs,
+        ttft_ms: null, usage: null, error_code: errorCode, error_message: message,
+      });
+    } catch (archiveErr) { console.warn(`[archive] failed to persist failed event ${requestId}:`, archiveErr); }
+  };
   const evictReasoningReplayIdentity = (): void => {
     if (!conversationId || !variantHash) return;
     getReasoningReplayCache().evictByIdentity({
@@ -207,6 +225,7 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
       relayCodexTurnState(c, currentRawResponse, fmt.tag);
       return c.json(result.response);
     } catch (collectErr) {
+      recordFailure(collectErr, attempt);
       if (conversationId && variantHash && containsInvalidEncryptedContentSignal(collectErr)) {
         evictReasoningReplayIdentity();
       }
