@@ -68,14 +68,33 @@ export interface KeeperEventPage {
 export class RequestArchive {
   private readonly enabled: boolean;
   private readonly path: string;
+  private readonly maxInFlightBytes: number;
   private db: SqliteDatabase | null = null;
+  /** Bytes currently reserved by in-progress stream captures. Guards the
+   *  proxy's own heap: when exhausted, new captures are skipped rather than
+   *  risking an OOM that would take down request handling. */
+  private inFlightBytes = 0;
 
-  constructor(options: { enabled?: boolean; path?: string } = {}) {
+  constructor(options: { enabled?: boolean; path?: string; maxInFlightBytes?: number } = {}) {
     this.enabled = options.enabled === true;
     this.path = options.path ?? `${getDataDir()}/request-archive.sqlite`;
+    this.maxInFlightBytes = options.maxInFlightBytes ?? 128 * 1024 * 1024;
   }
 
   isEnabled(): boolean { return this.enabled; }
+
+  /** Reserve capture budget for `bytes`; false means the global budget is full. */
+  tryReserveCapture(bytes: number): boolean {
+    if (bytes <= 0) return true;
+    if (this.inFlightBytes + bytes > this.maxInFlightBytes) return false;
+    this.inFlightBytes += bytes;
+    return true;
+  }
+
+  releaseCapture(bytes: number): void {
+    if (bytes <= 0) return;
+    this.inFlightBytes = Math.max(0, this.inFlightBytes - bytes);
+  }
 
   recordFailed(event: KeeperEvent): void {
     if (!this.enabled) return;

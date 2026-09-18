@@ -113,6 +113,9 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
   const capturedChunks: string[] = [];
   let capturedBytes = 0;
   let captureOverflow = false;
+  // Bytes reserved from the archive's global in-flight budget; released once
+  // this request finishes so other streams can capture.
+  let reservedCaptureBytes = 0;
   let streamError: unknown = null;
   const metadataCollector = createResponseMetadataCollector();
   const reasoningReplayCache = getReasoningReplayCache();
@@ -200,9 +203,18 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           // Bound in-memory capture so a huge response cannot exhaust the
           // container heap; oversized responses are simply not archived.
           if (captureOverflow) return;
+          if (!requestArchive.tryReserveCapture(chunk.length)) {
+            captureOverflow = true;
+            capturedChunks.length = 0;
+            console.warn(`[archive] in-flight capture budget exhausted; skipping archive rid=${requestId.slice(0, 8)}`);
+            return;
+          }
+          reservedCaptureBytes += chunk.length;
           capturedBytes += chunk.length;
           if (capturedBytes > maxArchiveResponseBytes) {
             captureOverflow = true;
+            requestArchive.releaseCapture(reservedCaptureBytes);
+            reservedCaptureBytes = 0;
             capturedChunks.length = 0;
             console.warn(`[archive] response exceeds ${maxArchiveResponseBytes} bytes; skipping archive rid=${requestId.slice(0, 8)}`);
             return;
@@ -309,6 +321,12 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         } catch (archiveErr) {
           console.warn(`[archive] failed to persist completed stream ${requestId}:`, archiveErr);
         }
+      }
+      // Release this request's share of the in-flight capture budget on every
+      // terminal path so later streams can capture.
+      if (requestArchive && reservedCaptureBytes > 0) {
+        requestArchive.releaseCapture(reservedCaptureBytes);
+        reservedCaptureBytes = 0;
       }
       if (usageInfo) {
         recordClientKeyUsage(c, req.model, usageInfo);

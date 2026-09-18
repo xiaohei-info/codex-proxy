@@ -194,7 +194,10 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   // Last-resort upstream apikey (single, Responses API wire). Used only when
   // every OAuth account is unavailable.
   const fallbackUpstreamStore = new FallbackUpstreamStore();
-  const requestArchive = new RequestArchive({ enabled: config.archive.enabled });
+  const requestArchive = new RequestArchive({
+    enabled: config.archive.enabled,
+    maxInFlightBytes: config.archive.max_inflight_bytes,
+  });
 
   // Mount routes
   const authRoutes = createAuthRoutes(accountPool, refreshScheduler);

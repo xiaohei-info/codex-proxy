@@ -108,3 +108,15 @@ describe("RequestArchive", () => {
     archive.close();
   });
 });
+
+describe("RequestArchive capture budget", () => {
+  it("caps concurrent in-flight capture and allows reuse after release", () => {
+    const archive = new RequestArchive({ enabled: true, path: "/tmp/archive-budget-test.sqlite", maxInFlightBytes: 100 });
+    expect(archive.tryReserveCapture(60)).toBe(true);
+    expect(archive.tryReserveCapture(50)).toBe(false);
+    expect(archive.tryReserveCapture(40)).toBe(true);
+    archive.releaseCapture(100);
+    expect(archive.tryReserveCapture(100)).toBe(true);
+    archive.close();
+  });
+});
