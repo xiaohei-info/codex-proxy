@@ -18,6 +18,7 @@ import { getReasoningReplayCache } from "../../proxy/reasoning-replay-cache.js";
 import { getWsPool } from "../../proxy/ws-pool.js";
 import { forwardCodexRateLimitHeaders } from "./codex-rate-limit-response-headers.js";
 import { relayCodexTurnState } from "./codex-turn-state.js";
+import { getConfig } from "../../config.js";
 import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
@@ -102,7 +103,16 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
   let capturedResponseId: string | null = null;
   let responseCompleted = false;
   let streamCompletedWithoutError = false;
+  // Read once per request; archive config is static at runtime.
+  let maxArchiveResponseBytes = Number.POSITIVE_INFINITY;
+  try {
+    maxArchiveResponseBytes = getConfig().archive.max_response_bytes;
+  } catch {
+    // Config not ready (tests) — capture without a cap rather than failing the stream.
+  }
   const capturedChunks: string[] = [];
+  let capturedBytes = 0;
+  let captureOverflow = false;
   let streamError: unknown = null;
   const metadataCollector = createResponseMetadataCollector();
   const reasoningReplayCache = getReasoningReplayCache();
@@ -185,7 +195,20 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         onFirstToken: (ts) => {
           firstTokenMs = ts;
         },
-        onChunk: (chunk) => { if (requestArchive?.isEnabled()) capturedChunks.push(chunk); },
+        onChunk: (chunk) => {
+          if (!requestArchive?.isEnabled()) return;
+          // Bound in-memory capture so a huge response cannot exhaust the
+          // container heap; oversized responses are simply not archived.
+          if (captureOverflow) return;
+          capturedBytes += chunk.length;
+          if (capturedBytes > maxArchiveResponseBytes) {
+            captureOverflow = true;
+            capturedChunks.length = 0;
+            console.warn(`[archive] response exceeds ${maxArchiveResponseBytes} bytes; skipping archive rid=${requestId.slice(0, 8)}`);
+            return;
+          }
+          capturedChunks.push(chunk);
+        },
         usageHint,
         onResponseMetadata: (metadata) => {
           metadataCollector.onResponseMetadata(metadata);
@@ -253,7 +276,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           console.warn(`[archive] failed to persist failed stream ${requestId}:`, archiveErr);
         }
       }
-      if (streamCompletedWithoutError && requestArchive) {
+      if (streamCompletedWithoutError && requestArchive && !captureOverflow) {
         const attemptId = `${requestId}:${attemptNumber}:${capturedEntryId}`;
         const event: KeeperEvent = {
           schema: KEEPER_EVENT_SCHEMA,

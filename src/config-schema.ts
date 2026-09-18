@@ -157,6 +157,9 @@ export const ConfigSchema = z.object({
   }).default({}),
   archive: z.object({
     enabled: z.boolean().default(false),
+    /** Per-request in-memory response cap for stream capture. A response larger
+     *  than this is not archived, keeping the proxy's own heap bounded. */
+    max_response_bytes: z.number().int().min(1024).default(16 * 1024 * 1024),
   }).default({}),
   // Local observability (no third-party SaaS). v1 ships a local
   // uncaught-error log; future iterations may add remote upload here.
