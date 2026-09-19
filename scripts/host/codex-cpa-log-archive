@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Host-side bridge for the existing CPA tar/zstd/rclone archive chain.
+#
+# It deliberately does not compress or upload anything itself:
+#   1. ask Codex Proxy to export one age-qualified JSONL batch;
+#   2. stage that file beside CPA logs;
+#   3. run the existing cpa-log-archive pipeline;
+#   4. commit the exact batch receipt only after that pipeline succeeds;
+#   5. remove the exported source file only after commit succeeds.
+set -Eeuo pipefail
+
+: "${CODEX_PROXY_URL:=http://127.0.0.1:8088}"
+: "${CODEX_PROXY_TOKEN:?CODEX_PROXY_TOKEN is required}"
+: "${CODEX_EXPORT_DIR:=/home/ubuntu/services/ai-gateway/codex-proxy/data/archive-export}"
+: "${CPA_LOG_DIR:=/home/ubuntu/services/ai-gateway/CLIProxyAPI/logs}"
+: "${CPA_ARCHIVER:=/usr/local/sbin/cpa-log-archive}"
+
+exec 9>/tmp/codex-cpa-log-archive.lock
+flock -n 9 || exit 0
+
+response="$(curl --noproxy '*' --fail --silent --show-error \
+  -X POST "${CODEX_PROXY_URL%/}/admin/integration/keeper/archive/export" \
+  -H "Authorization: Bearer ${CODEX_PROXY_TOKEN}")"
+
+batch="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("batch")))' <<<"$response")"
+if [[ "$batch" == "null" ]]; then
+  exec "$CPA_ARCHIVER"
+fi
+
+readarray -t fields < <(python3 -c '
+import json,sys
+b=json.load(sys.stdin)
+for key in ("batch_id", "file_name", "row_count", "sha256"):
+    value=b.get(key)
+    if value is None:
+        raise SystemExit(f"missing batch field: {key}")
+    print(value)
+' <<<"$batch")
+BATCH_ID="${fields[0]}"
+FILE_NAME="${fields[1]}"
+ROW_COUNT="${fields[2]}"
+SHA256="${fields[3]}"
+
+[[ "$FILE_NAME" =~ ^codex-proxy-requests-[0-9a-f-]+\.jsonl$ ]] || {
+  echo "invalid Codex archive file name" >&2
+  exit 1
+}
+SOURCE="${CODEX_EXPORT_DIR}/${FILE_NAME}"
+STAGE_DIR="${CPA_LOG_DIR}/codex-proxy"
+STAGE="${STAGE_DIR}/${FILE_NAME}"
+[[ -f "$SOURCE" ]] || { echo "Codex export file is missing: $SOURCE" >&2; exit 1; }
+mkdir -p "$STAGE_DIR"
+rm -f -- "$STAGE"
+cp -p -- "$SOURCE" "$STAGE"
+actual_sha256="$(sha256sum "$STAGE" | awk '{print $1}')"
+[[ "$actual_sha256" == "$SHA256" ]] || {
+  echo "Codex export checksum mismatch before CPA archive" >&2
+  rm -f -- "$STAGE"
+  exit 1
+}
+
+# CPA owns compression, remote upload, archive verification, and stage deletion.
+"$CPA_ARCHIVER"
+[[ ! -e "$STAGE" ]] || {
+  echo "CPA archive completed without deleting Codex staged file" >&2
+  exit 1
+}
+
+commit_body="$(python3 - "$BATCH_ID" "$FILE_NAME" "$ROW_COUNT" "$SHA256" <<'PY'
+import json,sys
+print(json.dumps({
+    "batch_id": sys.argv[1],
+    "file_name": sys.argv[2],
+    "row_count": int(sys.argv[3]),
+    "sha256": sys.argv[4],
+}))
+PY
+)"
+commit_response="$(curl --noproxy '*' --fail --silent --show-error \
+  -X POST "${CODEX_PROXY_URL%/}/admin/integration/keeper/archive/commit" \
+  -H "Authorization: Bearer ${CODEX_PROXY_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data "$commit_body")"
+
+python3 -c '
+import json,sys
+x=json.load(sys.stdin)
+if x.get("status") not in ("committed", "already_committed"):
+    raise SystemExit(f"unexpected Codex archive commit response: {x}")
+' <<<"$commit_response"
+
+# The JSONL source is retained until the remote archive and DB commit both pass.
+rm -f -- "$SOURCE"
+printf 'Codex archive committed: batch=%s rows=%s file=%s\n' "$BATCH_ID" "$ROW_COUNT" "$FILE_NAME"

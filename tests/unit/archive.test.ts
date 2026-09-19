@@ -1,6 +1,7 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import { tmpdir } from "node:os";
-import { accessSync } from "node:fs";
+import { accessSync, readFileSync } from "node:fs";
 import { KEEPER_EVENT_SCHEMA, validateKeeperEvent, type KeeperEvent } from "../../src/archive/keeper-event.js";
 import { RequestArchive, sanitizeArchiveHeaders } from "../../src/archive/request-archive.js";
 import { createKeeperIntegrationRoutes } from "../../src/routes/admin/keeper-integration.js";
@@ -92,6 +93,108 @@ describe("Keeper export", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ events: [], next_cursor: 0, has_more: false, cursor_gap: false });
     expect(() => accessSync(path)).toThrow();
+  });
+});
+
+describe("external archive hand-off", () => {
+  it("exports only cutoff-eligible complete rows and commits them safely", async () => {
+    const root = `${tmpdir()}/archive-handoff-${Date.now()}-${Math.random()}`;
+    const path = `${root}.sqlite`;
+    const exportDir = `${root}-out`;
+    const archive = new RequestArchive({ enabled: true, path, exportDir, exportAfterMs: 60 * 60 * 1000 });
+    const oldEvent = { ...event, event_id: "evt-old", request_id: "req-old", attempt_id: "attempt-old" };
+    const newEvent = { ...event, event_id: "evt-new", request_id: "req-new", attempt_id: "attempt-new" };
+    archive.recordCompleted({
+      event: oldEvent,
+      requestHeaders: { "Content-Type": "application/json" },
+      requestBody: { prompt: "old prompt" },
+      responseHeaders: { "Content-Type": "application/json" },
+      responseBody: { output: "old response" },
+    });
+    archive.recordCompleted({
+      event: newEvent,
+      requestHeaders: {},
+      requestBody: { prompt: "new prompt" },
+      responseHeaders: {},
+      responseBody: { output: "new response" },
+    });
+
+    // Make one row old and leave the other inside the cutoff window.
+    const require = createRequire(import.meta.url);
+    let Database: new (filename: string) => { prepare(sql: string): { run(...args: unknown[]): unknown }; close(): void };
+    try {
+      const sqlite = require("node:sqlite") as { DatabaseSync?: typeof Database };
+      if (!sqlite.DatabaseSync) throw new Error("node:sqlite unavailable");
+      Database = sqlite.DatabaseSync;
+    } catch {
+      Database = require("better-sqlite3");
+    }
+    const db = new Database(path);
+    db.prepare("UPDATE completed_requests SET created_at = ? WHERE event_id = ?").run("2020-01-01T00:00:00.000Z", "evt-old");
+    db.close();
+
+    const batch = await archive.exportArchiveBatch();
+    expect(batch).not.toBeNull();
+    expect(batch!.rowCount).toBe(1);
+    expect(batch!.fileName).toMatch(/^codex-proxy-requests-[0-9a-f-]+\.jsonl$/);
+    const line = JSON.parse(readFileSync(batch!.filePath, "utf8"));
+    expect(line).toMatchObject({
+      event_id: "evt-old",
+      request_body: { prompt: "old prompt" },
+      response_body: { output: "old response" },
+      created_at: "2020-01-01T00:00:00.000Z",
+    });
+    expect(archive.readRequestLog("req-old")).not.toBeNull();
+    expect(archive.readRequestLog("req-new")).not.toBeNull();
+
+    // A retry before commit returns the same batch rather than advancing.
+    const retry = await archive.exportArchiveBatch();
+    expect(retry?.batchId).toBe(batch!.batchId);
+
+    const receipt = {
+      batchId: batch!.batchId,
+      fileName: batch!.fileName,
+      rowCount: batch!.rowCount,
+      sha256: batch!.sha256,
+    };
+    const committed = archive.commitArchiveBatch(receipt);
+    expect(committed).toMatchObject({ state: "committed", deletedRows: 1 });
+    expect(archive.readRequestLog("req-old")).toBeNull();
+    expect(archive.readRequestLog("req-new")).not.toBeNull();
+    expect(archive.commitArchiveBatch(receipt)).toMatchObject({ state: "already_committed", deletedRows: 0 });
+    expect(() => archive.commitArchiveBatch({ ...receipt, sha256: "f".repeat(64) })).toThrow(/does not match/);
+    archive.close();
+  });
+
+  it("keeps rows when the external archive has not committed the batch", async () => {
+    const root = `${tmpdir()}/archive-handoff-retry-${Date.now()}-${Math.random()}`;
+    const archive = new RequestArchive({ enabled: true, path: `${root}.sqlite`, exportDir: `${root}-out`, exportAfterMs: 0 });
+    archive.recordCompleted({ event, requestHeaders: {}, requestBody: { prompt: "must survive" }, responseHeaders: {}, responseBody: null });
+    const batch = await archive.exportArchiveBatch();
+    expect(batch).not.toBeNull();
+    archive.close();
+
+    const reopened = new RequestArchive({ enabled: true, path: `${root}.sqlite`, exportDir: `${root}-out`, exportAfterMs: 0 });
+    const retry = await reopened.exportArchiveBatch();
+    expect(retry?.batchId).toBe(batch!.batchId);
+    expect(reopened.readRequestLog(event.request_id)).not.toBeNull();
+    reopened.close();
+  });
+
+  it("rejects a mismatched archive receipt without deleting source rows", async () => {
+    const root = `${tmpdir()}/archive-handoff-receipt-${Date.now()}-${Math.random()}`;
+    const archive = new RequestArchive({ enabled: true, path: `${root}.sqlite`, exportDir: `${root}-out`, exportAfterMs: 0 });
+    archive.recordCompleted({ event, requestHeaders: {}, requestBody: { prompt: "must survive" }, responseHeaders: {}, responseBody: null });
+    const batch = await archive.exportArchiveBatch();
+    expect(batch).not.toBeNull();
+    expect(() => archive.commitArchiveBatch({
+      batchId: batch!.batchId,
+      fileName: batch!.fileName,
+      rowCount: batch!.rowCount,
+      sha256: "0".repeat(64),
+    })).toThrow(/does not match/);
+    expect(archive.readRequestLog(event.request_id)).not.toBeNull();
+    archive.close();
   });
 });
 

@@ -196,6 +196,10 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const fallbackUpstreamStore = new FallbackUpstreamStore();
   const requestArchive = new RequestArchive({
     enabled: config.archive.enabled,
+    exportDir: config.archive.export_dir || undefined,
+    exportAfterMs: config.archive.export_after_minutes * 60 * 1000,
+    exportBatchSize: config.archive.export_batch_size,
+    exportMaxBytes: config.archive.export_max_bytes,
     maxInFlightBytes: config.archive.max_inflight_bytes,
   });
 

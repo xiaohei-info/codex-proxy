@@ -167,6 +167,14 @@ export const ConfigSchema = z.object({
     /** Global budget for concurrent in-flight stream captures. When exhausted,
      *  further responses are not archived so request handling stays safe. */
     max_inflight_bytes: z.number().int().min(0).default(32 * 1024 * 1024),
+    /** Host hand-off directory consumed by the CPA archive job. */
+    export_dir: z.string().default(""),
+    /** Keep completed rows hot for this long before exporting them. */
+    export_after_minutes: z.number().int().min(1).default(120),
+    /** Maximum request records per one external-archive hand-off. */
+    export_batch_size: z.number().int().min(1).default(500),
+    /** Maximum UTF-8 bytes in one JSONL hand-off file. */
+    export_max_bytes: z.number().int().min(1024).default(256 * 1024 * 1024),
   }).default({}),
   // Local observability (no third-party SaaS). v1 ships a local
   // uncaught-error log; future iterations may add remote upload here.

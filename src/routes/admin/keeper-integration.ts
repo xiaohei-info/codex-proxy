@@ -7,6 +7,13 @@ const QuerySchema = z.object({
   limit: z.preprocess((value) => value === undefined ? 100 : Number(value), z.number().int().min(1).max(500)),
 });
 
+const CommitSchema = z.object({
+  batch_id: z.string().uuid(),
+  file_name: z.string().regex(/^codex-proxy-requests-[0-9a-f-]+\.jsonl$/),
+  row_count: z.number().int().positive(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/i),
+});
+
 /** Read-only, metadata-only export for external analytics collectors. */
 export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
   const app = new Hono();
@@ -27,6 +34,62 @@ export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
       has_more: page.hasMore,
       cursor_gap: page.cursorGap,
       events: page.events,
+    });
+  });
+  /**
+   * Host-side CPA archive hook. Export never deletes rows; the host must call
+   * commit after its tar/zstd/rclone pipeline has verified the JSONL file.
+   * These routes are mounted behind the global dashboard/Bearer auth gate.
+   */
+  app.post("/admin/integration/keeper/archive/export", async (c) => {
+    const batch = await archive.exportArchiveBatch();
+    if (!batch) return c.json({ status: "empty", batch: null });
+    return c.json({
+      schema: "codex-proxy.archive-batch.v1",
+      status: "exported",
+      batch: {
+        batch_id: batch.batchId,
+        file_name: batch.fileName,
+        row_count: batch.rowCount,
+        first_request_id: batch.firstRequestId,
+        last_request_id: batch.lastRequestId,
+        cutoff: batch.cutoff,
+        bytes: batch.bytes,
+        sha256: batch.sha256,
+      },
+    });
+  });
+  app.post("/admin/integration/keeper/archive/commit", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      c.status(400);
+      return c.json({ error: "Invalid JSON body" });
+    }
+    const parsed = CommitSchema.safeParse(body);
+    if (!parsed.success) {
+      c.status(400);
+      return c.json({ error: "Invalid batch_id", details: parsed.error.issues });
+    }
+    let result;
+    try {
+      result = archive.commitArchiveBatch({
+        batchId: parsed.data.batch_id,
+        fileName: parsed.data.file_name,
+        rowCount: parsed.data.row_count,
+        sha256: parsed.data.sha256,
+      });
+    } catch (error) {
+      c.status(409);
+      return c.json({ error: error instanceof Error ? error.message : "Archive commit rejected" });
+    }
+    if (!result) return c.notFound();
+    return c.json({
+      schema: "codex-proxy.archive-batch.v1",
+      status: result.state,
+      batch_id: result.batchId,
+      deleted_rows: result.deletedRows,
     });
   });
   // Keeper's request-log UI splits on real newlines and localizes section
