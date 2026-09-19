@@ -318,7 +318,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           status_code: 200,
           failed: false,
           fallback,
-          latency_ms: null,
+          latency_ms: Date.now() - streamStartMs,
           ttft_ms: firstTokenMs === null ? null : firstTokenMs - streamStartMs,
           usage: usageInfo ?? null,
           error_code: null,

@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { SessionAffinityMap } from "@src/auth/session-affinity.js";
 import type { AccountPool } from "@src/auth/account-pool.js";
 import type { CodexApi } from "@src/proxy/codex-api.js";
+import type { RequestArchive } from "@src/archive/request-archive.js";
 import { handleStreaming } from "@src/routes/shared/streaming-handler.js";
 import type { ProxyRequest } from "@src/routes/shared/proxy-handler-types.js";
 import type { FormatStreamTranslatorOptions } from "@src/routes/shared/proxy-handler-types.js";
@@ -162,6 +163,57 @@ describe("handleStreaming", () => {
       accountEntryId: "entry-stream",
       variantHash: "variant-stream",
     });
+  });
+
+  it("records latency on successful Keeper completion events", async () => {
+    const { pool } = createMockAccountPool();
+    const affinityMap = new SessionAffinityMap();
+    affinityMaps.push(affinityMap);
+    const abortController = new AbortController();
+    const recordCompleted = vi.fn();
+    const requestArchive = {
+      isEnabled: () => true,
+      tryReserveCapture: () => true,
+      releaseCapture: vi.fn(),
+      recordCompleted,
+    } as unknown as RequestArchive;
+    const fmt = createMockFormatAdapter({
+      streamTranslator: vi.fn(async function* (options: FormatStreamTranslatorOptions) {
+        options.onUsage({ input_tokens: 10, output_tokens: 2, cached_tokens: 4, reasoning_tokens: 1 });
+        options.onResponseCompleted?.("resp_latency");
+        yield "event: response.completed\\ndata: {}\\n\\n";
+      }),
+    });
+    const app = new Hono();
+
+    app.get("/stream", (c) => handleStreaming({
+      c,
+      accountPool: pool,
+      req: createStreamingRequest(),
+      fmt,
+      api: {} as unknown as CodexApi,
+      response: new Response(""),
+      entryId: "entry-latency",
+      abortController,
+      released: new Set<string>(),
+      requestId: "request-latency",
+      affinityMap,
+      conversationId: "conversation-latency",
+      variantHash: "variant-latency",
+      requestArchive,
+      archiveRequestBody: { prompt: "hello" },
+    }));
+
+    const response = await app.request("/stream");
+    await response.text();
+
+    expect(recordCompleted).toHaveBeenCalledTimes(1);
+    const event = recordCompleted.mock.calls[0][0].event;
+    expect(event.event_type).toBe("request.completed");
+    expect(event.latency_ms).toEqual(expect.any(Number));
+    expect(event.latency_ms).toBeGreaterThanOrEqual(0);
+    expect(event.ttft_ms).toEqual(expect.any(Number));
+    expect(event.usage).toEqual({ input_tokens: 10, output_tokens: 2, cached_tokens: 4, reasoning_tokens: 1 });
   });
 
   it("relays turn state for the native Responses format", async () => {

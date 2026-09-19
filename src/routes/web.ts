@@ -97,7 +97,7 @@ export function createWebRoutes(
   app.route("/", createLogRoutes());
   app.route("/", createErrorLogRoutes());
   if (requestArchive) {
-    app.route("/", createKeeperIntegrationRoutes(requestArchive));
+    app.route("/", createKeeperIntegrationRoutes(requestArchive, accountPool));
   }
   if (clientKeyPool) {
     app.route(

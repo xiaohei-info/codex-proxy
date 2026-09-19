@@ -5,6 +5,7 @@ import { accessSync, readFileSync } from "node:fs";
 import { KEEPER_EVENT_SCHEMA, validateKeeperEvent, type KeeperEvent } from "../../src/archive/keeper-event.js";
 import { RequestArchive, sanitizeArchiveHeaders } from "../../src/archive/request-archive.js";
 import { createKeeperIntegrationRoutes } from "../../src/routes/admin/keeper-integration.js";
+import type { AccountPool } from "../../src/auth/account-pool.js";
 
 const event: KeeperEvent = {
   schema: KEEPER_EVENT_SCHEMA,
@@ -89,10 +90,72 @@ describe("Keeper export", () => {
   it("returns an empty response without creating storage when disabled", async () => {
     const path = `/tmp/codex-proxy-disabled-${Date.now()}-${Math.random()}.sqlite`;
     const archive = new RequestArchive({ enabled: false, path });
-    const response = await createKeeperIntegrationRoutes(archive).request("http://localhost/admin/integration/keeper/events");
+    const response = await createKeeperIntegrationRoutes(archive, { getAccounts: () => [] } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/events");
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ events: [], next_cursor: 0, has_more: false, cursor_gap: false });
     expect(() => accessSync(path)).toThrow();
+  });
+
+  it("exports token-free account metadata with quota observations", async () => {
+    const archive = new RequestArchive({ enabled: false, path: `/tmp/codex-proxy-account-metadata-${Date.now()}.sqlite` });
+    const response = await createKeeperIntegrationRoutes(archive, {
+      getAccounts: () => [{
+        id: "entry-1",
+        email: "user@example.com",
+        accountId: "acct-1",
+        organizationId: null,
+        accountIdSource: "access_token",
+        userId: "user-1",
+        label: "Primary",
+        codexFingerprintMode: "off",
+        planType: "pro",
+        status: "active",
+        usage: {
+          request_count: 3,
+          input_tokens: 100,
+          output_tokens: 20,
+          cached_tokens: 80,
+          empty_response_count: 0,
+          last_used: "2026-01-01T00:00:00.000Z",
+          window_request_count: 3,
+          window_input_tokens: 100,
+          window_output_tokens: 20,
+          window_cached_tokens: 80,
+          window_counters_reset_at: null,
+          limit_window_seconds: 604800,
+        },
+        addedAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2026-02-01T00:00:00.000Z",
+        quota: {
+          plan_type: "pro",
+          rate_limit: {
+            used_percent: 10,
+            remaining_percent: 90,
+            reset_at: 123,
+            limit_window_seconds: 604800,
+            allowed: true,
+            limit_reached: false,
+          },
+          secondary_rate_limit: null,
+          code_review_rate_limit: null,
+        },
+        quotaFetchedAt: "2026-01-01T00:00:00.000Z",
+        quotaVerifyRequired: false,
+      }],
+    } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/accounts");
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { schema: string; accounts: Array<Record<string, unknown>> };
+    expect(payload.schema).toBe("codex-proxy.keeper-account-metadata.v1");
+    expect(payload.accounts[0]).toMatchObject({
+      account_entry_id: "entry-1",
+      email: "user@example.com",
+      account_id: "acct-1",
+      cached_quota: expect.objectContaining({ plan_type: "pro" }),
+    });
+    expect(payload.accounts[0]).not.toHaveProperty("token");
+    expect(payload.accounts[0]).not.toHaveProperty("refresh_token");
+    expect(payload.accounts[0]).not.toHaveProperty("proxy_api_key");
+    archive.close();
   });
 });
 

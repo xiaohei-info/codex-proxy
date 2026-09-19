@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { RequestArchive } from "../../archive/request-archive.js";
+import type { AccountPool } from "../../auth/account-pool.js";
+import type { AccountInfo } from "../../auth/types.js";
 
 const QuerySchema = z.object({
   after: z.preprocess((value) => value === undefined ? 0 : Number(value), z.number().int().min(0)),
@@ -15,8 +17,15 @@ const CommitSchema = z.object({
 });
 
 /** Read-only, metadata-only export for external analytics collectors. */
-export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
+export function createKeeperIntegrationRoutes(archive: RequestArchive, accountPool: AccountPool): Hono {
   const app = new Hono();
+  app.get("/admin/integration/keeper/accounts", (c) => {
+    const accounts = accountPool.getAccounts().map(toKeeperAccountMetadata);
+    return c.json({
+      schema: "codex-proxy.keeper-account-metadata.v1",
+      accounts,
+    });
+  });
   app.get("/admin/integration/keeper/events", (c) => {
     const parsed = QuerySchema.safeParse({
       after: c.req.query("after"),
@@ -109,4 +118,29 @@ export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
     return c.body(sections.join("\n\n"));
   });
   return app;
+}
+
+/**
+ * AccountInfo is already the proxy's token-free public view. Keep this
+ * contract explicit so future AccountInfo fields cannot accidentally expose a
+ * credential or proxy configuration through the Keeper integration.
+ */
+function toKeeperAccountMetadata(account: AccountInfo): Record<string, unknown> {
+  return {
+    account_entry_id: account.id,
+    email: account.email,
+    label: account.label,
+    account_id: account.accountId,
+    organization_id: account.organizationId ?? null,
+    user_id: account.userId,
+    account_id_source: account.accountIdSource ?? null,
+    plan_type: account.planType,
+    status: account.status,
+    usage: account.usage,
+    added_at: account.addedAt,
+    expires_at: account.expiresAt,
+    cached_quota: account.quota ?? null,
+    quota_fetched_at: account.quotaFetchedAt ?? null,
+    quota_verify_required: account.quotaVerifyRequired ?? false,
+  };
 }
