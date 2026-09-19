@@ -18,9 +18,11 @@ import { toErrorStatus } from "./proxy-error-handler.js";
 import type { HandleDirectRequestOptions } from "./proxy-handler-types.js";
 import { canReturnStreamError, streamErrorResponse } from "./stream-error-response.js";
 import { recordClientKeyUsage } from "./proxy-handler-utils.js";
+import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
+import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 export async function handleDirectRequest(options: HandleDirectRequestOptions): Promise<Response> {
-  const { c, upstream, req, fmt } = options;
+  const { c, upstream, req, fmt, requestArchive, archiveRequestBody, archiveRequestHeaders = {} } = options;
   const abortController = new AbortController();
   c.req.raw.signal.addEventListener("abort", () => abortController.abort(), { once: true });
 
@@ -109,6 +111,9 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
       let usageInfo: UsageInfo | null = null;
       let firstTokenMs: number | null = null;
       let clientAborted = false;
+      const capturedChunks: string[] = [];
+      let capturedBytes = 0;
+      let captureOverflow = false;
       s.onAbort(() => {
         clientAborted = true;
         console.warn(`[stream-client-abort] rid=${requestId.slice(0, 8)} tag=${fmt.tag} model=${req.model}`);
@@ -123,6 +128,7 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
         });
         abortController.abort();
       });
+      let streamError: unknown = null;
       try {
         await streamResponse({
           writer: s,
@@ -139,6 +145,16 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
           onFirstToken: (ts) => {
             firstTokenMs = ts;
           },
+          onChunk: (chunk) => {
+            if (!requestArchive?.isEnabled() || captureOverflow) return;
+            if (!requestArchive.tryReserveCapture(chunk.length)) {
+              captureOverflow = true;
+              capturedChunks.length = 0;
+              return;
+            }
+            capturedBytes += chunk.length;
+            capturedChunks.push(chunk);
+          },
           diagnostics: {
             requestId: requestId.slice(0, 8),
             tag: fmt.tag,
@@ -149,6 +165,43 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
           },
         });
       } finally {
+        // Archive once at terminal state; never per chunk.
+        if (requestArchive?.isEnabled()) {
+          const succeeded = rawResponse.ok && !clientAborted && !streamError;
+          const event: KeeperEvent = {
+            schema: KEEPER_EVENT_SCHEMA,
+            event_id: `${requestId}:${upstream.tag}:1${succeeded ? "" : ":failed"}`,
+            event_type: succeeded ? "request.completed" : "request.failed",
+            occurred_at: new Date().toISOString(),
+            request_id: requestId,
+            attempt_id: `${requestId}:${upstream.tag}:1`,
+            account_entry_id: null,
+            provider: upstream.tag,
+            endpoint: "/v1/responses",
+            model: req.model,
+            status_code: rawResponse.status,
+            failed: !succeeded,
+            fallback: isFallback,
+            latency_ms: Date.now() - startMs,
+            ttft_ms: firstTokenMs === null ? null : firstTokenMs - startMs,
+            usage: usageInfo ?? null,
+            error_code: null,
+            error_message: succeeded ? null : sanitizeArchiveErrorMessage(streamError ?? `HTTP ${rawResponse.status}`),
+          };
+          const captured = capturedChunks.join("");
+          try {
+            requestArchive.recordCompleted({
+              event,
+              requestHeaders: archiveRequestHeaders,
+              requestBody: archiveRequestBody ?? req.codexRequest,
+              responseHeaders: Object.fromEntries(rawResponse.headers.entries()),
+              responseBody: captured.length > 0 ? captured : null,
+            });
+          } catch (archiveErr) {
+            console.warn(`[archive] failed to persist direct stream ${requestId}:`, archiveErr);
+          }
+          if (capturedBytes > 0) requestArchive.releaseCapture(capturedBytes);
+        }
         const metrics = calculateLogMetrics({
           startMs,
           firstTokenMs,
@@ -182,6 +235,40 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
       tupleSchema: req.tupleSchema,
     });
     recordClientKeyUsage(c, req.model, result.usage);
+    if (requestArchive?.isEnabled()) {
+      const succeeded = rawResponse.ok;
+      const event: KeeperEvent = {
+        schema: KEEPER_EVENT_SCHEMA,
+        event_id: `${requestId}:${upstream.tag}:1${succeeded ? "" : ":failed"}`,
+        event_type: succeeded ? "request.completed" : "request.failed",
+        occurred_at: new Date().toISOString(),
+        request_id: requestId,
+        attempt_id: `${requestId}:${upstream.tag}:1`,
+        account_entry_id: null,
+        provider: upstream.tag,
+        endpoint: "/v1/responses",
+        model: req.model,
+        status_code: rawResponse.status,
+        failed: !succeeded,
+        fallback: isFallback,
+        latency_ms: Date.now() - startMs,
+        ttft_ms: null,
+        usage: result.usage ?? null,
+        error_code: null,
+        error_message: succeeded ? null : `upstream HTTP ${rawResponse.status}`,
+      };
+      try {
+        requestArchive.recordCompleted({
+          event,
+          requestHeaders: archiveRequestHeaders,
+          requestBody: archiveRequestBody ?? req.codexRequest,
+          responseHeaders: Object.fromEntries(rawResponse.headers.entries()),
+          responseBody: result.response,
+        });
+      } catch (archiveErr) {
+        console.warn(`[archive] failed to persist direct response ${requestId}:`, archiveErr);
+      }
+    }
     const metrics = calculateLogMetrics({
       startMs,
       endMs: Date.now(),
@@ -206,6 +293,40 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
   } catch (err) {
     abortController.abort();
     const msg = err instanceof Error ? err.message : "Failed to collect upstream response";
+    if (requestArchive?.isEnabled()) {
+      try {
+        requestArchive.recordCompleted({
+          event: {
+            schema: KEEPER_EVENT_SCHEMA,
+            event_id: `${requestId}:${upstream.tag}:1:failed`,
+            event_type: "request.failed",
+            occurred_at: new Date().toISOString(),
+            request_id: requestId,
+            attempt_id: `${requestId}:${upstream.tag}:1`,
+            account_entry_id: null,
+            provider: upstream.tag,
+            endpoint: "/v1/responses",
+            model: req.model,
+            status_code: err instanceof CodexApiError ? err.status : null,
+            failed: true,
+            fallback: isFallback,
+            latency_ms: Date.now() - startMs,
+            ttft_ms: null,
+            usage: null,
+            error_code: null,
+            error_message: sanitizeArchiveErrorMessage(err),
+          },
+          requestHeaders: archiveRequestHeaders,
+          requestBody: archiveRequestBody ?? req.codexRequest,
+          responseHeaders: {},
+          responseBody: err instanceof CodexApiError && err.body
+            ? (() => { try { return JSON.parse(err.body); } catch { return err.body; } })()
+            : msg,
+        });
+      } catch (archiveErr) {
+        console.warn(`[archive] failed to persist direct failure ${requestId}:`, archiveErr);
+      }
+    }
     const code = toErrorStatus(0) as StatusCode;
     c.status(code);
     updateLogEntry(requestId, {

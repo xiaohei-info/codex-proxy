@@ -34,6 +34,15 @@ import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-even
 
 const MAX_EMPTY_RETRIES = 2;
 
+/** Best-effort JSON view of an archived upstream error body. */
+function safeParseArchiveBody(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
 export interface HandleNonStreamingOptions {
   c: Context;
   accountPool: AccountPool;
@@ -99,15 +108,29 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
     const errorCode = err instanceof CodexApiError ? (() => {
       try { const parsed = JSON.parse(err.body) as { code?: unknown; error?: { code?: unknown } }; return typeof parsed.code === "string" ? parsed.code : typeof parsed.error?.code === "string" ? parsed.error.code : null; } catch { return null; }
     })() : null;
+    // Capture the upstream error body when present so the failure archive is
+    // as inspectable as a success. CodexApiError.body holds the upstream text.
+    const errorBody = err instanceof CodexApiError && err.body ? safeParseArchiveBody(err.body) : null;
+    const responseHeaders = err instanceof CodexApiError
+      ? Object.fromEntries((err.headers ?? new Headers()).entries())
+      : {};
     try {
-      requestArchive.recordFailed({
-        schema: KEEPER_EVENT_SCHEMA, event_id: `${requestId}:${currentEntryId}:${attemptNumber}:failed`,
-        event_type: "request.failed", occurred_at: new Date().toISOString(), request_id: requestId,
-        attempt_id: `${requestId}:${currentEntryId}:${attemptNumber}`, account_entry_id: currentEntryId,
-        provider: "codex", endpoint: "/codex/responses", model: req.model, status_code: status,
-        failed: true, fallback: currentEntryId !== initialEntryId, latency_ms: Date.now() - initialStartMs,
-        ttft_ms: null, usage: null, error_code: errorCode, error_message: message,
-      });
+      requestArchive.recordFailed(
+        {
+          schema: KEEPER_EVENT_SCHEMA, event_id: `${requestId}:${currentEntryId}:${attemptNumber}:failed`,
+          event_type: "request.failed", occurred_at: new Date().toISOString(), request_id: requestId,
+          attempt_id: `${requestId}:${currentEntryId}:${attemptNumber}`, account_entry_id: currentEntryId,
+          provider: "codex", endpoint: "/codex/responses", model: req.model, status_code: status,
+          failed: true, fallback: currentEntryId !== initialEntryId, latency_ms: Date.now() - initialStartMs,
+          ttft_ms: null, usage: null, error_code: errorCode, error_message: message,
+        },
+        {
+          requestHeaders: archiveRequestHeaders,
+          requestBody: archiveRequestBody ?? req.codexRequest,
+          responseHeaders,
+          responseBody: errorBody,
+        },
+      );
     } catch (archiveErr) { console.warn(`[archive] failed to persist failed event ${requestId}:`, archiveErr); }
   };
   const evictReasoningReplayIdentity = (): void => {

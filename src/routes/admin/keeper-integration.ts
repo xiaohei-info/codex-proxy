@@ -29,5 +29,37 @@ export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
       events: page.events,
     });
   });
+  // Keeper's request-log UI splits on real newlines and localizes section
+  // titles by exact match, so emit canonical titles with genuine "\n".
+  app.get("/admin/integration/keeper/request-log/:requestId", (c) => {
+    const record = archive.readRequestLog(c.req.param("requestId"));
+    if (!record) return c.notFound();
+    const render = (value: unknown): string =>
+      typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "null";
+    const event = record.event;
+    const info = [
+      `method: POST`,
+      `path: ${event.endpoint}`,
+      `model: ${event.model ?? ""}`,
+      `request_id: ${event.request_id}`,
+      `attempt_id: ${event.attempt_id}`,
+      `account: ${event.account_entry_id ?? ""}`,
+      `status: ${event.status_code ?? ""}`,
+      `failed: ${event.failed}`,
+      `latency_ms: ${event.latency_ms ?? ""}`,
+    ].join("\n");
+    const sections = [
+      `=== REQUEST INFO ===\n${info}`,
+      `=== HEADERS ===\n${render(record.requestHeaders)}`,
+      `=== API REQUEST ===\n${render(record.requestBody)}`,
+      `=== API RESPONSE ===\n${render(record.responseBody)}`,
+    ];
+    if (event.failed) {
+      sections.push(`=== API RESPONSE ERROR ===\n${event.error_code ?? "unknown"}: ${event.error_message ?? ""}`);
+    }
+    c.header("Content-Type", "text/plain; charset=utf-8");
+    c.header("Content-Disposition", `attachment; filename="${encodeURIComponent(event.request_id)}.log"`);
+    return c.body(sections.join("\n\n"));
+  });
   return app;
 }

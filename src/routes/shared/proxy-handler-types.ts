@@ -120,4 +120,7 @@ export interface HandleDirectRequestOptions {
   upstream: UpstreamAdapter;
   req: ProxyRequest;
   fmt: FormatAdapter;
+  requestArchive?: RequestArchive;
+  archiveRequestBody?: unknown;
+  archiveRequestHeaders?: Record<string, string>;
 }

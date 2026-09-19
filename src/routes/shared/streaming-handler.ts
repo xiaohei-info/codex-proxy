@@ -20,6 +20,7 @@ import { forwardCodexRateLimitHeaders } from "./codex-rate-limit-response-header
 import { relayCodexTurnState } from "./codex-turn-state.js";
 import { getConfig } from "../../config.js";
 import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
+import { CodexApiError } from "../../proxy/codex-types.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
 
 export interface HandleStreamingOptions {
@@ -280,11 +281,24 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           schema: KEEPER_EVENT_SCHEMA, event_id: `${attemptId}:failed`, event_type: "request.failed",
           occurred_at: new Date().toISOString(), request_id: requestId, attempt_id: attemptId,
           account_entry_id: capturedEntryId, provider: "codex", endpoint: "/codex/responses", model: req.model,
-          status_code: null, failed: true, fallback, latency_ms: Date.now() - streamStartMs,
+          status_code: streamError instanceof CodexApiError ? streamError.status : null,
+          failed: true, fallback, latency_ms: Date.now() - streamStartMs,
           ttft_ms: firstTokenMs === null ? null : firstTokenMs - streamStartMs, usage: null,
           error_code: null, error_message: sanitizeArchiveErrorMessage(streamError),
         };
-        try { requestArchive.recordFailed(event); } catch (archiveErr) {
+        // Archive the partial SSE the client actually received plus the error,
+        // so a failed stream is as inspectable as a successful one.
+        const partialResponse = capturedChunks.join("");
+        try {
+          requestArchive.recordFailed(event, {
+            requestHeaders: archiveRequestHeaders,
+            requestBody: archiveRequestBody ?? req.codexRequest,
+            responseHeaders: Object.fromEntries(response.headers.entries()),
+            responseBody: partialResponse.length > 0
+              ? partialResponse
+              : (streamError instanceof Error ? streamError.message : sanitizeArchiveErrorMessage(streamError)),
+          });
+        } catch (archiveErr) {
           console.warn(`[archive] failed to persist failed stream ${requestId}:`, archiveErr);
         }
       }

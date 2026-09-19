@@ -16,6 +16,7 @@ import type { UpstreamRouter } from "../proxy/upstream-router.js";
 import { supportsCodexAuxiliaryJson } from "../proxy/upstream-adapter.js";
 import { parseModelName, resolveModelId, isRequestableModel } from "../models/model-store.js";
 import { handleDirectRequest } from "./shared/direct-request-handler.js";
+import type { RequestArchive } from "../archive/request-archive.js";
 import { acquireAccount, releaseAccount } from "./shared/account-acquisition.js";
 import { handleCodexApiError } from "./shared/proxy-error-handler.js";
 import { staggerIfNeeded } from "./shared/proxy-stagger.js";
@@ -58,6 +59,8 @@ export async function handleCompact(
   proxyPool: ProxyPool | undefined,
   body: Record<string, unknown>,
   upstreamRouter?: UpstreamRouter,
+  requestArchive?: RequestArchive,
+  archiveRequestHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const rawModel = typeof body.model === "string" ? body.model : "codex";
   const compactRouteMatch = upstreamRouter?.resolveMatch(rawModel);
@@ -151,7 +154,7 @@ export async function handleCompact(
       model: directModel,
       isStreaming: false,
     };
-    return handleDirectRequest({ c, upstream: compactRouteMatch.adapter, req: directReq, fmt: PASSTHROUGH_FORMAT });
+    return handleDirectRequest({ c, upstream: compactRouteMatch.adapter, req: directReq, fmt: PASSTHROUGH_FORMAT, requestArchive, archiveRequestBody: body, archiveRequestHeaders });
   }
 
   const TAG = "Compact";

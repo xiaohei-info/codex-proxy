@@ -199,7 +199,7 @@ export function createChatRoutes(
         model: directModel,
         codexRequest: { ...codexRequest, model: directModel },
       };
-      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt });
+      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt, requestArchive, archiveRequestBody: req, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
     }
 
     // Auth check for Codex route only (a configured fallback upstream apikey

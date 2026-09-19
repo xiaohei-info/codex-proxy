@@ -5,6 +5,7 @@
  */
 
 import { Hono } from "hono";
+import type { RequestArchive } from "../archive/request-archive.js";
 import type { StatusCode } from "hono/utils/http-status";
 import type { GeminiErrorResponse } from "../types/gemini.js";
 import { GEMINI_STATUS_MAP } from "../types/gemini.js";
@@ -89,6 +90,7 @@ export function createGeminiRoutes(
   upstreamRouter?: UpstreamRouter,
   clientKeyPool?: ClientKeyPool,
   fallbackUpstream?: FallbackUpstreamStore,
+  requestArchive?: RequestArchive,
 ): Hono {
   const app = new Hono();
 
@@ -182,10 +184,10 @@ export function createGeminiRoutes(
         model: directModel,
         codexRequest: { ...codexRequest, model: directModel },
       };
-      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt: GEMINI_FORMAT });
+      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt: GEMINI_FORMAT, requestArchive, archiveRequestBody: rawBody, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
     }
 
-    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt: GEMINI_FORMAT, proxyPool, fallbackUpstream });
+    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt: GEMINI_FORMAT, proxyPool, fallbackUpstream, requestArchive, archiveRequestBody: rawBody, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
   });
 
   // List available models (Gemini format)

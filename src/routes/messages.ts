@@ -1,3 +1,4 @@
+import type { RequestArchive } from "../archive/request-archive.js";
 /**
  * Anthropic Messages API route handler.
  * POST /v1/messages — compatible with Claude Code CLI and other Anthropic clients.
@@ -139,6 +140,7 @@ export function createMessagesRoutes(
   upstreamRouter?: UpstreamRouter,
   clientKeyPool?: ClientKeyPool,
   fallbackUpstream?: FallbackUpstreamStore,
+  requestArchive?: RequestArchive,
 ): Hono {
   const app = new Hono();
 
@@ -246,10 +248,10 @@ export function createMessagesRoutes(
         model: directModel,
         codexRequest: { ...codexRequest, model: directModel },
       };
-      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt });
+      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt, requestArchive, archiveRequestBody: body, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
     }
 
-    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream });
+    return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt, proxyPool, fallbackUpstream, requestArchive, archiveRequestBody: body, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
   });
 
   return app;

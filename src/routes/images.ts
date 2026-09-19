@@ -1,3 +1,4 @@
+import type { RequestArchive } from "../archive/request-archive.js";
 /**
  * POST /v1/images/generations — OpenAI Images API 兼容入口。
  *
@@ -101,6 +102,7 @@ export function createImagesRoutes(
   cookieJar?: CookieJar,
   proxyPool?: ProxyPool,
   clientKeyPool?: ClientKeyPool,
+  requestArchive?: RequestArchive,
 ): Hono {
   const app = new Hono();
   app.onError(errorHandler);
@@ -171,6 +173,9 @@ export function createImagesRoutes(
       req: proxyReq,
       fmt: IMAGES_FORMAT,
       proxyPool,
+      requestArchive,
+      archiveRequestBody: request,
+      archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()),
     });
   };
 

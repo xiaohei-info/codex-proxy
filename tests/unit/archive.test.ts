@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
 import { accessSync } from "node:fs";
 import { KEEPER_EVENT_SCHEMA, validateKeeperEvent, type KeeperEvent } from "../../src/archive/keeper-event.js";
 import { RequestArchive, sanitizeArchiveHeaders } from "../../src/archive/request-archive.js";
@@ -117,6 +118,53 @@ describe("RequestArchive capture budget", () => {
     expect(archive.tryReserveCapture(40)).toBe(true);
     archive.releaseCapture(100);
     expect(archive.tryReserveCapture(100)).toBe(true);
+    archive.close();
+  });
+});
+
+describe("failed request archiving", () => {
+  const failedEvent: KeeperEvent = {
+    ...event,
+    event_id: "evt-fail-1",
+    event_type: "request.failed",
+    failed: true,
+    status_code: 503,
+    usage: null,
+    error_code: "server_is_overloaded",
+    error_message: "overloaded",
+  };
+
+  it("stores full request and response content for failures", () => {
+    const path = `${tmpdir()}/archive-fail-${Date.now()}.sqlite`;
+    const archive = new RequestArchive({ enabled: true, path });
+    archive.recordFailed(failedEvent, {
+      requestHeaders: { "content-type": "application/json", authorization: "Bearer secret" },
+      requestBody: { input: "the prompt" },
+      responseHeaders: { "content-type": "application/json" },
+      responseBody: { error: { code: "server_is_overloaded" } },
+    });
+
+    const record = archive.readRequestLog(failedEvent.request_id);
+    expect(record).not.toBeNull();
+    expect(record!.event.failed).toBe(true);
+    // full content retained on failure
+    expect(JSON.stringify(record!.requestBody)).toContain("the prompt");
+    expect(JSON.stringify(record!.responseBody)).toContain("server_is_overloaded");
+    // credentials still stripped
+    expect(Object.keys(record!.requestHeaders)).not.toContain("authorization");
+    archive.close();
+  });
+
+  it("returns null for an unknown request id", () => {
+    const path = `${tmpdir()}/archive-miss-${Date.now()}.sqlite`;
+    const archive = new RequestArchive({ enabled: true, path });
+    archive.recordFailed(failedEvent, {
+      requestHeaders: {},
+      requestBody: null,
+      responseHeaders: {},
+      responseBody: null,
+    });
+    expect(archive.readRequestLog("does-not-exist")).toBeNull();
     archive.close();
   });
 });

@@ -203,10 +203,10 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const authRoutes = createAuthRoutes(accountPool, refreshScheduler);
   const accountRoutes = createAccountRoutes(accountPool, refreshScheduler, cookieJar, proxyPool, fallbackUpstreamStore);
   const chatRoutes = createChatRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
-  const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
-  const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore);
+  const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
+  const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
   const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter, clientKeyPool, fallbackUpstreamStore, requestArchive);
-  const imagesRoutes = createImagesRoutes(accountPool, cookieJar, proxyPool, clientKeyPool);
+  const imagesRoutes = createImagesRoutes(accountPool, cookieJar, proxyPool, clientKeyPool, requestArchive);
   const apiKeyRoutes = createApiKeyRoutes(apiKeyPool, apiKeyModelCache, memoStore);
   const embeddingsRoutes = createEmbeddingsRoutes(accountPool, apiKeyPool, clientKeyPool);
   const proxyRoutes = createProxyRoutes(proxyPool, accountPool);

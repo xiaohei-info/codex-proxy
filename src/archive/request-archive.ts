@@ -96,14 +96,18 @@ export class RequestArchive {
     this.inFlightBytes = Math.max(0, this.inFlightBytes - bytes);
   }
 
-  recordFailed(event: KeeperEvent): void {
+  recordFailed(event: KeeperEvent, request: Omit<CompletedRequestArchive, "event"> = { requestHeaders: {}, requestBody: null, responseHeaders: {}, responseBody: null }): void {
     if (!this.enabled) return;
+    this.recordCompleted({ event, ...request });
+  }
+
+  readRequestLog(requestId: string): CompletedRequestArchive | null {
+    if (!this.enabled) return null;
     const db = this.open();
-    if (!db) return;
-    db.prepare(`
-      INSERT OR IGNORE INTO integration_events (event_id, event_json, created_at)
-      VALUES (?, ?, ?)
-    `).run(event.event_id, JSON.stringify(event), new Date().toISOString());
+    if (!db) return null;
+    const row = db.prepare(`SELECT event_json, request_headers_json, request_body_json, response_headers_json, response_body_json FROM completed_requests WHERE json_extract(event_json, '$.request_id') = ? ORDER BY id DESC LIMIT 1`).get(requestId) as Record<string, string> | undefined;
+    if (!row) return null;
+    return { event: JSON.parse(row.event_json), requestHeaders: JSON.parse(row.request_headers_json), requestBody: JSON.parse(row.request_body_json), responseHeaders: JSON.parse(row.response_headers_json), responseBody: JSON.parse(row.response_body_json) };
   }
 
   recordCompleted(request: CompletedRequestArchive): void {

@@ -321,7 +321,7 @@ export function createResponsesRoutes(
     if (routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter") {
       const directModel = routeMatch.resolvedModel ?? rawModel;
       const directReq = { ...proxyReq, model: directModel, codexRequest: { ...codexRequest, model: directModel } };
-      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt: PASSTHROUGH_FORMAT });
+      return handleDirectRequest({ c, upstream: routeMatch.adapter, req: directReq, fmt: PASSTHROUGH_FORMAT, requestArchive, archiveRequestBody: body, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
     }
 
     return handleProxyRequest({ c, accountPool, cookieJar, req: proxyReq, fmt: PASSTHROUGH_FORMAT, proxyPool, fallbackUpstream, requestArchive, archiveRequestBody: body, archiveRequestHeaders: Object.fromEntries(c.req.raw.headers.entries()) });
@@ -368,7 +368,7 @@ export function createResponsesRoutes(
       }),
     });
 
-    const res = await handleCompact(c, accountPool, cookieJar, proxyPool, body, upstreamRouter);
+    const res = await handleCompact(c, accountPool, cookieJar, proxyPool, body, upstreamRouter, requestArchive, Object.fromEntries(c.req.raw.headers.entries()));
     if (res.ok) {
       recordClientKeyUsage(c, rawModel, { input_tokens: 100, output_tokens: 100 });
     }
