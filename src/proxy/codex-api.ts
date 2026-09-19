@@ -402,6 +402,11 @@ export class CodexApi {
       includeTimingMetrics: _timing,
       codexWindowId: _window,
       parentThreadId: _parent,
+      // Proxy-internal routing hints: applied as headers by the upstream
+      // adapters (see opencode-headers.ts). They must never reach the JSON
+      // body — the Codex backend rejects unknown parameters outright.
+      clientUserAgent: _clientUserAgent,
+      opencodeSessionId: _opencodeSessionId,
       service_tier,
       ...bodyFields
     } = request;
