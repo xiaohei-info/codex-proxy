@@ -14,9 +14,18 @@ set -Eeuo pipefail
 : "${CODEX_EXPORT_DIR:=/home/ubuntu/services/ai-gateway/codex-proxy/data/archive-export}"
 : "${CPA_LOG_DIR:=/home/ubuntu/services/ai-gateway/CLIProxyAPI/logs}"
 : "${CPA_ARCHIVER:=/usr/local/sbin/cpa-log-archive}"
+: "${CPA_REMOTE_DIR:=alist-local-webdav:quark/中转站/oracle-backup}"
+: "${CPA_LOCK:=/tmp/cpa-log-archive.lock}"
 
-exec 9>/tmp/codex-cpa-log-archive.lock
+# Share CPA's lock: the bridge must never race the existing archiver.
+exec 9>"$CPA_LOCK"
 flock -n 9 || exit 0
+
+command -v rclone >/dev/null || { echo "rclone is required" >&2; exit 1; }
+findmnt -T "$CPA_LOG_DIR" -rn >/dev/null || { echo "CPA log mount/path is unavailable: $CPA_LOG_DIR" >&2; exit 1; }
+[[ -d "$CODEX_EXPORT_DIR" ]] || { echo "Codex export directory is unavailable: $CODEX_EXPORT_DIR" >&2; exit 1; }
+
+before_remote="$(rclone lsf --files-only "$CPA_REMOTE_DIR" | sort)"
 
 response="$(curl --noproxy '*' --fail --silent --show-error \
   -X POST "${CODEX_PROXY_URL%/}/admin/integration/keeper/archive/export" \
@@ -61,6 +70,17 @@ actual_sha256="$(sha256sum "$STAGE" | awk '{print $1}')"
 
 # CPA owns compression, remote upload, archive verification, and stage deletion.
 "$CPA_ARCHIVER"
+
+after_remote="$(rclone lsf --files-only "$CPA_REMOTE_DIR" | sort)"
+new_remote="$(comm -13 <(printf "%s\n" "$before_remote") <(printf "%s\n" "$after_remote") | sed "/^$/d")"
+remote_count="$(printf "%s\n" "$new_remote" | sed "/^$/d" | wc -l | tr -d " ")"
+[[ "$remote_count" -eq 1 ]] || {
+  echo "CPA archive produced $remote_count remotely visible new files; refusing commit" >&2
+  exit 1
+}
+remote_name="$new_remote"
+remote_size="$(rclone size --json "$CPA_REMOTE_DIR/$remote_name" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("bytes", 0))')"
+[[ "$remote_size" -gt 0 ]] || { echo "remote archive is empty or not durable: $remote_name" >&2; exit 1; }
 [[ ! -e "$STAGE" ]] || {
   echo "CPA archive completed without deleting Codex staged file" >&2
   exit 1
