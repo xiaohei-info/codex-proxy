@@ -112,7 +112,45 @@ describe("Keeper export", () => {
     }
   });
 
-  it("exports identity-only account metadata without credentials or quota aggregates", async () => {
+
+  it("preserves optional quota observations exactly without inventing missing values", async () => {
+    const quota = {
+      plan_type: "pro",
+      rate_limit: { used_percent: null, remaining_percent: null, reset_at: null, limit_window_seconds: 18000, allowed: false, limit_reached: true },
+      secondary_rate_limit: { used_percent: 25, remaining_percent: 75, reset_at: 1789805393, limit_window_seconds: 604800, limit_reached: false },
+      code_review_rate_limit: null,
+      credits: { has_credits: true, unlimited: false, overage_limit_reached: false, balance: 1.25 },
+      reset_credits_available: null,
+      rate_limits_by_limit_id: {
+        model_bucket: { limit_id: "model_bucket", limit_name: null, allowed: true, limit_reached: false, used_percent: 0, reset_at: null, limit_window_seconds: null, secondary_rate_limit: null },
+      },
+    };
+    const archive = new RequestArchive({ enabled: false });
+    const response = await createKeeperIntegrationRoutes(archive, {
+      getPersistenceHealth: () => ({ ok: true }),
+      getAccounts: () => [
+        { id: "observed", quota, quotaFetchedAt: "2026-01-01T00:00:00.000Z", quotaVerifyRequired: true,
+          token: "secret-access", refreshToken: "secret-refresh", proxyUrl: "secret-proxy", usage: { request_count: 9 } },
+        { id: "absent" },
+        { id: "unknown-time", quotaFetchedAt: null, quotaVerifyRequired: false },
+      ],
+    } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/accounts");
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.schema).toBe("codex-proxy.keeper-account-metadata.v1");
+    expect(payload.status).toBe("ready");
+    expect(payload.accounts[0]).toEqual({ account_entry_id: "observed", organization_id: null, account_id_source: null,
+      quota, quota_fetched_at: "2026-01-01T00:00:00.000Z", quota_verify_required: true });
+    for (const field of ["quota", "quota_fetched_at", "quota_verify_required"]) {
+      expect(payload.accounts[1]).not.toHaveProperty(field);
+    }
+    expect(payload.accounts[2]).not.toHaveProperty("quota");
+    expect(payload.accounts[2].quota_fetched_at).toBeNull();
+    expect(payload.accounts[2].quota_verify_required).toBe(false);
+    expect(JSON.stringify(payload)).not.toContain("secret-");
+  });
+
+  it("exports account identity and observed quota without credentials or usage aggregates", async () => {
     const archive = new RequestArchive({ enabled: false, path: `/tmp/codex-proxy-account-metadata-${Date.now()}.sqlite` });
     const response = await createKeeperIntegrationRoutes(archive, {
       getPersistenceHealth: () => ({ ok: true }),
@@ -168,9 +206,12 @@ describe("Keeper export", () => {
       email: "user@example.com",
       account_id: "acct-1",
     });
-    for (const key of ["usage", "cached_quota", "quota_fetched_at", "quota_verify_required"]) {
-      expect(payload.accounts[0]).not.toHaveProperty(key);
-    }
+    expect(payload.accounts[0]).toMatchObject({
+      quota: { plan_type: "pro", rate_limit: { used_percent: 10, remaining_percent: 90 } },
+      quota_fetched_at: "2026-01-01T00:00:00.000Z",
+      quota_verify_required: false,
+    });
+    expect(payload.accounts[0]).not.toHaveProperty("usage");
     expect(payload.accounts[0]).not.toHaveProperty("token");
     expect(payload.accounts[0]).not.toHaveProperty("refresh_token");
     expect(payload.accounts[0]).not.toHaveProperty("proxy_api_key");

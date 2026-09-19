@@ -149,5 +149,10 @@ function toKeeperAccountMetadata(account: AccountInfo): Record<string, unknown> 
     status: account.status,
     added_at: account.addedAt,
     expires_at: account.expiresAt,
+    // Optional observed quota, not usage-derived estimates. Preserve missing
+    // values and freshness flags so consumers cannot mistake unknown for zero.
+    quota: account.quota,
+    quota_fetched_at: account.quotaFetchedAt,
+    quota_verify_required: account.quotaVerifyRequired,
   };
 }
