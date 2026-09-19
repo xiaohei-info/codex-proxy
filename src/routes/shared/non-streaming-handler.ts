@@ -121,6 +121,7 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
           event_type: "request.failed", occurred_at: new Date().toISOString(), request_id: requestId,
           attempt_id: `${requestId}:${currentEntryId}:${attemptNumber}`, account_entry_id: currentEntryId,
           provider: "codex", endpoint: "/codex/responses", model: req.model, status_code: status,
+          reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
           failed: true, fallback: currentEntryId !== initialEntryId, latency_ms: Date.now() - initialStartMs,
           ttft_ms: null, usage: null, error_code: errorCode, error_message: message,
         },

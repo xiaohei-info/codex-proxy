@@ -147,11 +147,7 @@ function toKeeperAccountMetadata(account: AccountInfo): Record<string, unknown> 
     account_id_source: account.accountIdSource ?? null,
     plan_type: account.planType,
     status: account.status,
-    usage: account.usage,
     added_at: account.addedAt,
     expires_at: account.expiresAt,
-    cached_quota: account.quota ?? null,
-    quota_fetched_at: account.quotaFetchedAt ?? null,
-    quota_verify_required: account.quotaVerifyRequired ?? false,
   };
 }

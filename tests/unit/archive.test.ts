@@ -112,7 +112,7 @@ describe("Keeper export", () => {
     }
   });
 
-  it("exports token-free account metadata with quota observations", async () => {
+  it("exports identity-only account metadata without credentials or quota aggregates", async () => {
     const archive = new RequestArchive({ enabled: false, path: `/tmp/codex-proxy-account-metadata-${Date.now()}.sqlite` });
     const response = await createKeeperIntegrationRoutes(archive, {
       getPersistenceHealth: () => ({ ok: true }),
@@ -167,8 +167,10 @@ describe("Keeper export", () => {
       account_entry_id: "entry-1",
       email: "user@example.com",
       account_id: "acct-1",
-      cached_quota: expect.objectContaining({ plan_type: "pro" }),
     });
+    for (const key of ["usage", "cached_quota", "quota_fetched_at", "quota_verify_required"]) {
+      expect(payload.accounts[0]).not.toHaveProperty(key);
+    }
     expect(payload.accounts[0]).not.toHaveProperty("token");
     expect(payload.accounts[0]).not.toHaveProperty("refresh_token");
     expect(payload.accounts[0]).not.toHaveProperty("proxy_api_key");
