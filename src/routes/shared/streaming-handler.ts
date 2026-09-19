@@ -280,7 +280,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         const event: KeeperEvent = {
           schema: KEEPER_EVENT_SCHEMA, event_id: `${attemptId}:failed`, event_type: "request.failed",
           occurred_at: new Date().toISOString(), request_id: requestId, attempt_id: attemptId,
-          account_entry_id: capturedEntryId, provider: "codex", endpoint: "/codex/responses", model: req.model,
+          account_entry_id: capturedEntryId, provider: "codex", endpoint: "/codex/responses", downstream_transport: "sse", model: req.model,
           reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
           status_code: streamError instanceof CodexApiError ? streamError.status : null,
           failed: true, fallback, latency_ms: Date.now() - streamStartMs,
@@ -314,7 +314,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           attempt_id: attemptId,
           account_entry_id: capturedEntryId,
           provider: "codex",
-          endpoint: "/codex/responses",
+          endpoint: "/codex/responses", downstream_transport: "sse",
           model: req.model,
           reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
           status_code: 200,

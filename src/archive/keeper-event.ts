@@ -20,6 +20,8 @@ export interface KeeperEvent {
   account_entry_id: string | null;
   provider: string | null;
   endpoint: string;
+  /** Actual downstream response transport; absent in older events. */
+  downstream_transport?: "sse" | "http";
   model: string | null;
   /** Optional request-side reasoning configuration; absent in older events. */
   reasoning_effort?: string | null;

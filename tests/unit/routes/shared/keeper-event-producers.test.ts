@@ -18,6 +18,8 @@ describe("Keeper event producer contract", () => {
           .map((property) => [property.name.getText(file), property.initializer.getText(file)]));
         if (fields.get("schema") === "KEEPER_EVENT_SCHEMA") {
           count++;
+          const transport = name === "streaming-handler" || (name === "direct-request-handler" && count === 1) ? "sse" : "http";
+          expect(fields.get("downstream_transport")).toBe(JSON.stringify(transport));
           expect(fields.get("request_id")).toBe("requestId");
           for (const key of ["event_id", "attempt_id"]) {
             expect(fields.get(key)).toMatch(/requestId|attemptId/);
