@@ -178,3 +178,52 @@ describe("LogStore", () => {
     expect(record?.usage?.output_tokens).toBe(50);
   });
 });
+
+describe("LogStore byte budget", () => {
+  const bigBody = (kb: number) => ({ body: "x".repeat(kb * 1024) });
+  const record = (id: string, kb: number) => ({
+    id,
+    requestId: `r${id}`,
+    direction: "ingress" as const,
+    ts: new Date().toISOString(),
+    method: "POST",
+    path: "/v1/chat/completions",
+    request: bigBody(kb),
+  });
+
+  it("evicts oldest records when the byte budget is exceeded", async () => {
+    // 100KB budget, 40KB records => only ~2 fit even though capacity is 10.
+    const store = new LogStore(10, 100 * 1024);
+    for (const id of ["1", "2", "3", "4", "5"]) store.enqueue(record(id, 40));
+    await Promise.resolve();
+
+    const state = store.getState();
+    expect(state.size).toBeLessThanOrEqual(3);
+    expect(state.bytes).toBeLessThanOrEqual(state.maxBytes);
+    // newest survives, oldest evicted
+    const ids = store.list({ limit: 10, offset: 0 }).records.map((r) => r.id);
+    expect(ids).toContain("5");
+    expect(ids).not.toContain("1");
+  });
+
+  it("still honours the count capacity independently", async () => {
+    const store = new LogStore(2, 1024 * 1024 * 1024);
+    for (const id of ["1", "2", "3"]) store.enqueue(record(id, 1));
+    await Promise.resolve();
+    expect(store.getState().size).toBe(2);
+  });
+
+  it("releases bytes on clear and shrinks when maxBytes is lowered", async () => {
+    const store = new LogStore(10, 1024 * 1024);
+    for (const id of ["1", "2", "3", "4"]) store.enqueue(record(id, 40));
+    await Promise.resolve();
+    expect(store.getState().bytes).toBeGreaterThan(0);
+
+    store.setState({ maxBytes: 50 * 1024 });
+    expect(store.getState().bytes).toBeLessThanOrEqual(50 * 1024);
+
+    store.clear();
+    expect(store.getState().bytes).toBe(0);
+    expect(store.getState().size).toBe(0);
+  });
+});

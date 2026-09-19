@@ -154,6 +154,10 @@ export const ConfigSchema = z.object({
     capacity: z.number().int().min(1).default(2000),
     capture_body: z.boolean().default(false),
     llm_only: z.boolean().default(true),
+    /** Approximate heap budget for retained in-memory log records. With
+     *  capture_body enabled, count-based capacity alone can exceed the
+     *  container heap, so old records are also evicted by total bytes. */
+    max_bytes: z.number().int().min(0).default(64 * 1024 * 1024),
   }).default({}),
   archive: z.object({
     enabled: z.boolean().default(false),
