@@ -20,9 +20,20 @@ const CommitSchema = z.object({
 export function createKeeperIntegrationRoutes(archive: RequestArchive, accountPool: AccountPool): Hono {
   const app = new Hono();
   app.get("/admin/integration/keeper/accounts", (c) => {
+    const persistenceHealth = accountPool.getPersistenceHealth();
+    if (!persistenceHealth.ok) {
+      c.status(503);
+      return c.json({
+        schema: "codex-proxy.keeper-account-metadata.v1",
+        status: "unavailable",
+        reason: "account_registry_unhealthy",
+        message: persistenceHealth.message,
+      });
+    }
     const accounts = accountPool.getAccounts().map(toKeeperAccountMetadata);
     return c.json({
       schema: "codex-proxy.keeper-account-metadata.v1",
+      status: "ready",
       accounts,
     });
   });

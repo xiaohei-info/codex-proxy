@@ -90,15 +90,32 @@ describe("Keeper export", () => {
   it("returns an empty response without creating storage when disabled", async () => {
     const path = `/tmp/codex-proxy-disabled-${Date.now()}-${Math.random()}.sqlite`;
     const archive = new RequestArchive({ enabled: false, path });
-    const response = await createKeeperIntegrationRoutes(archive, { getAccounts: () => [] } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/events");
+    const response = await createKeeperIntegrationRoutes(archive, { getAccounts: () => [], getPersistenceHealth: () => ({ ok: true }) } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/events");
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ events: [], next_cursor: 0, has_more: false, cursor_gap: false });
     expect(() => accessSync(path)).toThrow();
   });
 
+  it.each([true, false])("reports healthy=%s without disguising load failure as empty accounts", async (ok) => {
+    const archive = new RequestArchive({ enabled: false });
+    const response = await createKeeperIntegrationRoutes(archive, {
+      getAccounts: () => [],
+      getPersistenceHealth: () => ({ ok, message: ok ? undefined : "Account store failed to load" }),
+    } as unknown as AccountPool).request("http://localhost/admin/integration/keeper/accounts");
+    expect(response.status).toBe(ok ? 200 : 503);
+    const payload = await response.json();
+    if (ok) {
+      expect(payload).toMatchObject({ status: "ready", accounts: [] });
+    } else {
+      expect(payload).toMatchObject({ status: "unavailable", reason: "account_registry_unhealthy" });
+      expect(payload).not.toHaveProperty("accounts");
+    }
+  });
+
   it("exports token-free account metadata with quota observations", async () => {
     const archive = new RequestArchive({ enabled: false, path: `/tmp/codex-proxy-account-metadata-${Date.now()}.sqlite` });
     const response = await createKeeperIntegrationRoutes(archive, {
+      getPersistenceHealth: () => ({ ok: true }),
       getAccounts: () => [{
         id: "entry-1",
         email: "user@example.com",
