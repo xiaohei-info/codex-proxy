@@ -634,3 +634,28 @@ describe("collectPassthrough premature close handling", () => {
     ).rejects.toThrow("late stream error");
   });
 });
+
+// Usage-only samples from archived completed responses; no prompt or output text.
+describe("Responses reasoning usage regression", () => {
+  it.each([
+    { input_tokens: 56509, output_tokens: 167, total_tokens: 56676, output_tokens_details: { reasoning_tokens: 13 } },
+    { input_tokens: 55475, output_tokens: 104, total_tokens: 55579, output_tokens_details: { reasoning_tokens: 9 } },
+    { input_tokens: 1, output_tokens: 2, total_tokens: 3, output_tokens_details: { reasoning_tokens: 0 } },
+    { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+    { input_tokens: 1, output_tokens: 2, total_tokens: 3, output_tokens_details: { reasoning_tokens: "13" } },
+  ])("preserves reasoning through stream and collect: %j", async (usage) => {
+    const events = [{ event: "response.completed", data: { type: "response.completed", response: { id: "fixture", status: "completed", usage, output: [{ type: "function_call", call_id: "fixture", name: "fixture", arguments: "{}" }] } } }];
+    let streamed: unknown;
+    let wire = "";
+    for await (const chunk of streamPassthrough(createMockApi(events) as never, new Response(), "fixture", u => { streamed = u; }, () => {})) wire += chunk;
+    const collected = await collectPassthrough(createMockApi(events) as never, new Response(), "fixture");
+    const reasoning = usage.output_tokens_details?.reasoning_tokens;
+    const expected = { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, ...(typeof reasoning === "number" ? { reasoning_tokens: reasoning } : {}) };
+    expect(streamed).toEqual(expected);
+    expect(collected.usage).toEqual(expected);
+    expect(JSON.parse(JSON.stringify({ usage: collected.usage })).usage).toEqual(expected);
+    expect(collected.usage.input_tokens + collected.usage.output_tokens).toBe(usage.total_tokens);
+    expect(wire).toContain(JSON.stringify(usage));
+    expect((collected.response as { usage: unknown }).usage).toEqual(usage);
+  });
+});

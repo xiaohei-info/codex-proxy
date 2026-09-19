@@ -72,6 +72,15 @@ describe("/v1/responses extractResponseUsage", () => {
   });
 });
 
+  it("extracts real reasoning details and does not fold them into total", () => {
+    const usage = extractResponseUsage({ input_tokens: 56509, output_tokens: 167, output_tokens_details: { reasoning_tokens: 13 } });
+    expect(usage).toEqual({ input_tokens: 56509, output_tokens: 167, reasoning_tokens: 13 });
+    expect(usage.input_tokens + usage.output_tokens).toBe(56676);
+  });
+  it.each([undefined, null, "13", {}, { reasoning_tokens: "13" }])("omits invalid reasoning details: %s", (details) => {
+    expect(extractResponseUsage({ input_tokens: 1, output_tokens: 2, output_tokens_details: details })).toEqual({ input_tokens: 1, output_tokens: 2 });
+  });
+
 describe("/v1/responses extractImageGenUsage", () => {
   it("extracts image_input_tokens / image_output_tokens from tool_usage.image_gen", () => {
     expect(extractImageGenUsage({
