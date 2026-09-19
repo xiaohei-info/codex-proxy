@@ -41,24 +41,8 @@ export function createKeeperIntegrationRoutes(archive: RequestArchive): Hono {
    * commit after its tar/zstd/rclone pipeline has verified the JSONL file.
    * These routes are mounted behind the global dashboard/Bearer auth gate.
    */
-  app.post("/admin/integration/keeper/archive/export", async (c) => {
-    const batch = await archive.exportArchiveBatch();
-    if (!batch) return c.json({ status: "empty", batch: null });
-    return c.json({
-      schema: "codex-proxy.archive-batch.v1",
-      status: "exported",
-      batch: {
-        batch_id: batch.batchId,
-        file_name: batch.fileName,
-        row_count: batch.rowCount,
-        first_request_id: batch.firstRequestId,
-        last_request_id: batch.lastRequestId,
-        cutoff: batch.cutoff,
-        bytes: batch.bytes,
-        sha256: batch.sha256,
-      },
-    });
-  });
+  app.post("/admin/integration/keeper/archive/export", (c) =>
+    c.json({ error: "Use the host streaming exporter" }, 409));
   app.post("/admin/integration/keeper/archive/commit", async (c) => {
     let body: unknown;
     try {

@@ -1,0 +1,61 @@
+--- cpa-log-archive
++++ cpa-log-archive
+@@ -2,6 +2,8 @@
+ set -Eeuo pipefail
+ 
+ umask 077
++# CPA_REMOTE_VERIFIED_V1
++: "${CPA_VERIFY_REMOTE:?Set a direct Quark remote, not an Alist/VFS cache}"
+ 
+ LOG_DIR="/home/ubuntu/services/ai-gateway/CLIProxyAPI/logs"
+ REMOTE_DIR="/mnt/rclone/quark/中转站/oracle-backup"
+@@ -9,10 +11,12 @@
+ CACHE_BASE="/home/ubuntu/.cache/rclone/vfs/alist-local-webdav"
+ CACHE_META_BASE="/home/ubuntu/.cache/rclone/vfsMeta/alist-local-webdav"
+ 
+-exec 9>/tmp/cpa-log-archive.lock
+-if ! flock -n 9; then
+-  echo "another archive run is already in progress"
+-  exit 0
++if [[ "${CPA_INHERITED_LOCK:-0}" == 1 ]]; then
++  [[ "$(readlink /proc/$$/fd/9)" == /tmp/cpa-log-archive.lock ]] || exit 1
++  flock -n 9 || exit 1
++else
++  exec 9>/tmp/cpa-log-archive.lock
++  flock -n 9 || exit 1
+ fi
+ 
+ die() {
+@@ -47,7 +51,7 @@
+ stamp="$(date +%G-W%V-%Y%m%d%H%M%S)"
+ name="CPA_logs_${stamp}.tar.zst"
+ DEST="$REMOTE_DIR/$name"
+-PART="$DEST.part"
++PART="$(mktemp /var/tmp/cpa-archive.XXXXXX.tar.zst)"
+ 
+ echo "archiving $expected files to $DEST"
+ sudo -n tar -C "$LOG_DIR" \
+@@ -64,7 +68,14 @@
+ [[ "$entries" -eq "$expected" ]] \
+   || die "archive entry count mismatch: expected=$expected actual=$entries"
+ 
+-mv -- "$PART" "$DEST"
++# Upload directly, not through asynchronous mount writes. Verify by reading
++# back the exact bytes from Quark through a cache-independent remote.
++local_sha="$(sha256sum "$PART" | awk '{print $1}')"
++rclone copyto "$PART" "${CPA_VERIFY_REMOTE%/}/$name" || die "upload failed"
++remote_sha="$(rclone cat "${CPA_VERIFY_REMOTE%/}/$name" | sha256sum | awk '{print $1}')" \
++  || die "remote readback failed"
++[[ "$remote_sha" == "$local_sha" ]] || die "remote checksum mismatch"
++rm -f -- "$PART"
+ PART=""
+ 
+ sudo -n env LOG_DIR="$LOG_DIR" MANIFEST="$MANIFEST" bash -c '
+@@ -83,7 +94,5 @@
+ [[ "$remaining" -eq 0 ]] \
+   || die "archive succeeded but $remaining source files remain"
+ 
+-remote_rel="quark/中转站/oracle-backup/$name"
+-rm -f -- "$CACHE_BASE/$remote_rel" "$CACHE_META_BASE/$remote_rel" || true
+ 
+ echo "completed: archived=$expected entries=$entries destination=$DEST"
