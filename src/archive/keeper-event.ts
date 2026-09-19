@@ -21,6 +21,8 @@ export interface KeeperEvent {
   provider: string | null;
   endpoint: string;
   model: string | null;
+  /** Optional request-side reasoning configuration; absent in older events. */
+  reasoning_effort?: string | null;
   status_code: number | null;
   failed: boolean;
   fallback: boolean;

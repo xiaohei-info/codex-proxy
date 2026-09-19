@@ -179,6 +179,7 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
             provider: upstream.tag,
             endpoint: "/v1/responses",
             model: req.model,
+          reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
             status_code: rawResponse.status,
             failed: !succeeded,
             fallback: isFallback,

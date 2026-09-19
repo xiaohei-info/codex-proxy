@@ -33,6 +33,7 @@ function createStreamingRequest(): ProxyRequest {
       model: "codex",
       instructions: "You are helpful",
       input: [{ role: "user", content: "hello" }],
+      reasoning: { effort: "high" },
       stream: true,
     },
     model: "codex",
@@ -214,6 +215,7 @@ describe("handleStreaming", () => {
     expect(event.latency_ms).toBeGreaterThanOrEqual(0);
     expect(event.ttft_ms).toEqual(expect.any(Number));
     expect(event.usage).toEqual({ input_tokens: 10, output_tokens: 2, cached_tokens: 4, reasoning_tokens: 1 });
+    expect(event.reasoning_effort).toBe("high");
   });
 
   it("relays turn state for the native Responses format", async () => {

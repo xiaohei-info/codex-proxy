@@ -167,6 +167,7 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
           provider: "codex",
           endpoint: "/codex/responses",
           model: req.model,
+          reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
           status_code: 200,
           failed: false,
           fallback: currentEntryId !== initialEntryId,
