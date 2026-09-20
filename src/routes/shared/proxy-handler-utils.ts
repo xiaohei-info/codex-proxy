@@ -80,7 +80,7 @@ export function buildCodexApi(
     proxyUrl,
     undefined,
     undefined,
-    { codexFingerprintMode },
+    { codexFingerprintMode, experimentalTurnState: true },
   );
 }
 

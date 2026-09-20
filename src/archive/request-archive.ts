@@ -1,3 +1,4 @@
+import { redactTurnStateJson } from "../experimental/turn-state/redact.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
@@ -45,7 +46,7 @@ const SENSITIVE_HEADER = /(?:^|[-_])(authorization|proxy-authorization|cookie|se
 
 /** Archive headers exclude credential-bearing names while retaining ordinary metadata. */
 export function sanitizeArchiveHeaders(headers: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(Object.entries(headers).filter(([name]) => !SENSITIVE_HEADER.test(name)));
+  return Object.fromEntries(Object.entries(headers).filter(([name]) => !SENSITIVE_HEADER.test(name) && name.toLowerCase() !== "x-codex-turn-state"));
 }
 
 /** Keep diagnostic failures bounded and free of likely credential-bearing payloads. */
@@ -275,9 +276,9 @@ export class RequestArchive {
       request.event.event_id,
       eventJson,
       JSON.stringify(sanitizeArchiveHeaders(request.requestHeaders)),
-      JSON.stringify(request.requestBody),
+      redactTurnStateJson(request.requestBody),
       JSON.stringify(sanitizeArchiveHeaders(request.responseHeaders)),
-      JSON.stringify(request.responseBody),
+      redactTurnStateJson(request.responseBody),
       new Date().toISOString(),
     );
     if (Number(inserted.lastInsertRowid) > 0) {

@@ -111,6 +111,8 @@ export async function* parseSSEStream(
       };
     }
   } finally {
+    // Propagate early consumer return/abort through the decoder to the upstream body.
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

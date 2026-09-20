@@ -1,4 +1,5 @@
 import { resolve } from "path";
+import { turnStateRuntime } from "./experimental/turn-state/runtime.js";
 import { logStore } from "./logs/store.js";
 import { loadStaticModels } from "./models/model-store.js";
 import { triggerImmediateRefresh } from "./models/model-fetcher.js";
@@ -94,6 +95,7 @@ export function reloadConfig(configDir?: string): AppConfig {
   _localOverrides = local;
   const fresh = ConfigSchema.parse(raw);
   _config = fresh;
+  turnStateRuntime.update(fresh.experimental_turn_state);
   logStore.setState({ maxBytes: _config.logs.max_bytes });
   return _config;
 }

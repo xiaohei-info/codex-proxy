@@ -1,4 +1,6 @@
 import "./utils/install-dev-logger.js";
+import { startTurnState } from "./experimental/turn-state/integration.js";
+import { turnStateRuntime } from "./experimental/turn-state/runtime.js";
 
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
@@ -110,6 +112,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const cookieJar = new CookieJar();
   const proxyPool = new ProxyPool();
   refreshScheduler.setProxyPool(proxyPool);
+  startTurnState(accountPool, cookieJar, proxyPool);
 
   // Reactive refresh: when upstream 401 marks an account expired, trigger immediate RT→AT refresh.
   // Skip if the scheduler itself just marked it expired (permanent failure) — isRefreshing() is
@@ -317,6 +320,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   await startOllamaBridge(getConfig(), { upstreamBaseUrl });
 
   const close = async (): Promise<void> => {
+    turnStateRuntime.shutdown();
     await stopOllamaBridge();
     await responsesWebsocket.close();
     return new Promise((resolve) => {

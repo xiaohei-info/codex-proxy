@@ -1,3 +1,4 @@
+import { createTurnStateRoutes } from "./admin/turn-state.js";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -92,6 +93,7 @@ export function createWebRoutes(
   app.route("/", createUpdateRoutes());
   app.route("/", createConnectionRoutes(accountPool));
   app.route("/", createSettingsRoutes(accountPool));
+  app.route("/", createTurnStateRoutes());
   app.route("/", createOllamaAdminRoutes());
   app.route("/", createUsageStatsRoutes(accountPool, usageStats));
   app.route("/", createLogRoutes());

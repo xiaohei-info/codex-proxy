@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TurnStateConfigSchema } from "./experimental/turn-state/policy.js";
 
 export const ROTATION_STRATEGIES = ["least_used", "round_robin", "sticky"] as const;
 
@@ -66,6 +67,7 @@ function isWebSocketUrl(value: string): boolean {
 }
 
 export const ConfigSchema = z.object({
+  experimental_turn_state: TurnStateConfigSchema.default({}),
   api: z.object({
     base_url: z.string().default("https://chatgpt.com/backend-api"),
     timeout_seconds: z.number().min(1).default(60),
