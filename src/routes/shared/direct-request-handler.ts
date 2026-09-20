@@ -20,6 +20,7 @@ import { canReturnStreamError, streamErrorResponse } from "./stream-error-respon
 import { recordClientKeyUsage } from "./proxy-handler-utils.js";
 import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
+import { keeperObservabilityFor } from "./keeper-observability.js";
 
 export async function handleDirectRequest(options: HandleDirectRequestOptions): Promise<Response> {
   const { c, upstream, req, fmt, requestArchive, archiveRequestBody, archiveRequestHeaders = {} } = options;
@@ -33,6 +34,10 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
   // so the audit log can surface "fallback" instead of an account name.
   const isFallback = upstream.tag === "fallback";
   const accountLog = isFallback ? "fallback" : undefined;
+  // Direct API-key upstreams have no account entry, so the plan resolution
+  // falls back to the assumed personal rule. The upstream model is still real.
+  const observability = (response: Response): ReturnType<typeof keeperObservabilityFor> =>
+    keeperObservabilityFor(response, {});
   let rawResponse: Response;
   try {
     rawResponse = await upstream.createResponse(req.codexRequest, abortController.signal);
@@ -189,6 +194,7 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
             usage: usageInfo ?? null,
             error_code: null,
             error_message: succeeded ? null : sanitizeArchiveErrorMessage(streamError ?? `HTTP ${rawResponse.status}`),
+            ...observability(rawResponse),
           };
           const captured = capturedChunks.join("");
           try {
@@ -260,6 +266,7 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
         usage: result.usage ?? null,
         error_code: null,
         error_message: succeeded ? null : `upstream HTTP ${rawResponse.status}`,
+        ...observability(rawResponse),
       };
       try {
         requestArchive.recordCompleted({
@@ -321,6 +328,7 @@ export async function handleDirectRequest(options: HandleDirectRequestOptions): 
             usage: null,
             error_code: null,
             error_message: sanitizeArchiveErrorMessage(err),
+            ...observability(rawResponse),
           },
           requestHeaders: archiveRequestHeaders,
           requestBody: archiveRequestBody ?? req.codexRequest,

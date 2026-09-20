@@ -23,6 +23,7 @@ import {
 import { createWebSocketResponse, type WsCreateRequest, type WsPoolContext } from "./ws-transport.js";
 import type { ParsedRateLimit } from "./rate-limit-headers.js";
 import { getInstallationId } from "./installation-id.js";
+import { markTransportReused } from "./upstream-observation.js";
 import { normalizeOpenAISubagent, OPENAI_SUBAGENT_HEADER } from "./openai-subagent.js";
 import {
   X_CODEX_WINDOW_ID_HEADER,
@@ -294,6 +295,10 @@ export class CodexApi {
       try { if (dispatched) attempt?.wire(kind); } catch { /* diagnostics cannot interrupt business dispatch */ }
     };
     const response = await this.dispatchResponse(request, signal, onRateLimits, poolCtx, wire);
+    // A pooled reuse replays the original handshake headers onto this response, so its
+    // x-codex-turn-state belongs to an earlier turn. Mark it for every consumer, not only
+    // when the experiment is enabled, so observability never reads a stale transport header.
+    if (reused) markTransportReused(response);
     if (attempt) {
       // A reused socket's upgrade header belongs to an earlier response. Body metadata remains authoritative.
       if (!reused) attempt.observe(response.headers.get("x-codex-turn-state") ?? undefined);

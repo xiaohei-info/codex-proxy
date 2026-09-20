@@ -30,6 +30,7 @@ import { updateLogEntry } from "../../logs/entry.js";
 import { calculateLogMetrics } from "../../logs/metrics.js";
 import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
+import { keeperObservabilityFor } from "./keeper-observability.js";
 
 
 const MAX_EMPTY_RETRIES = 2;
@@ -101,6 +102,12 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
   let currentApi = initialApi;
   let currentRawResponse = initialResponse;
   const initialStartMs = Date.now();
+  // Structural observations for the Keeper sink. Read from currentRawResponse at
+  // emit time because a retry swaps in a new response whose observation must win.
+  const currentObservation = (): ReturnType<typeof keeperObservabilityFor> => keeperObservabilityFor(
+    currentRawResponse,
+    { headerState: turnState, planType: accountPool.getEntry(currentEntryId)?.planType },
+  );
   const recordFailure = (err: unknown, attemptNumber: number): void => {
     if (!requestArchive || abortController.signal.aborted) return;
     const status = err instanceof CodexApiError ? err.status : null;
@@ -124,6 +131,7 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
           reasoning_effort: req.codexRequest.reasoning?.effort ?? null,
           failed: true, fallback: currentEntryId !== initialEntryId, latency_ms: Date.now() - initialStartMs,
           ttft_ms: null, usage: null, error_code: errorCode, error_message: message,
+          ...currentObservation(),
         },
         {
           requestHeaders: archiveRequestHeaders,
@@ -177,6 +185,7 @@ export async function handleNonStreaming(options: HandleNonStreamingOptions): Pr
           usage: result.usage ?? null,
           error_code: null,
           error_message: null,
+          ...currentObservation(),
         };
         try {
           requestArchive.recordCompleted({

@@ -22,6 +22,7 @@ import { getConfig } from "../../config.js";
 import { sanitizeArchiveErrorMessage, type RequestArchive } from "../../archive/request-archive.js";
 import { CodexApiError } from "../../proxy/codex-types.js";
 import { KEEPER_EVENT_SCHEMA, type KeeperEvent } from "../../archive/keeper-event.js";
+import { keeperObservabilityFor } from "./keeper-observability.js";
 
 export interface HandleStreamingOptions {
   c: Context;
@@ -275,6 +276,12 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         );
       }
       if (streamCompletedWithoutError) clearCfChallengeCooldown(capturedEntryId);
+      // Structural observations for the Keeper sink: the model the upstream
+      // actually served and the shape of the turn state it returned this turn.
+      const observability = keeperObservabilityFor(response, {
+        headerState: turnState,
+        planType: accountPool.getEntry(capturedEntryId)?.planType,
+      });
       if (!streamCompletedWithoutError && !clientAborted && requestArchive) {
         const attemptId = `${requestId}:${attemptNumber}:${capturedEntryId}`;
         const event: KeeperEvent = {
@@ -286,6 +293,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           failed: true, fallback, latency_ms: Date.now() - streamStartMs,
           ttft_ms: firstTokenMs === null ? null : firstTokenMs - streamStartMs, usage: null,
           error_code: null, error_message: sanitizeArchiveErrorMessage(streamError),
+          ...observability,
         };
         // Archive the partial SSE the client actually received plus the error,
         // so a failed stream is as inspectable as a successful one.
@@ -325,6 +333,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
           usage: usageInfo ?? null,
           error_code: null,
           error_message: null,
+          ...observability,
         };
         try {
           requestArchive.recordCompleted({

@@ -27,20 +27,116 @@ export interface ParsedState {
   expires: number;
 }
 
-/** Structural heuristic only: not a signature, model identity, or quality check. */
-export function parseState(value: unknown, plan: Plan, ttl: number, now: number): ParsedState | null {
-  if (typeof value !== "string" || value.length > 2048 || !/^[A-Za-z0-9_-]+={0,2}$/.test(value)) return null;
-  const bare = value.replace(/=+$/, "");
-  const raw = Buffer.from(bare, "base64url");
-  if (raw.toString("base64url") !== bare || (value.includes("=") && value.length % 4 !== 0)) return null;
-  if (raw.length < 73 || raw[0] !== 0x80 || (raw.length - 57) % 16 !== 0) return null;
+/**
+ * Stable rule codes, in evaluation order: the first failing rule is reported.
+ * Frozen cross-repo contract — the Keeper sink validates these spellings.
+ */
+export type StateRule =
+  | "encoding_length"
+  | "encoding_whitespace"
+  | "encoding_padding"
+  | "encoding_base64"
+  | "envelope_too_short"
+  | "envelope_version"
+  | "envelope_structure"
+  | "timestamp_range"
+  | "timestamp_future"
+  | "expired"
+  | "block_mismatch";
+
+export type StateCheckVerdict = "ok" | "shape_mismatch" | "no_state" | "invalid" | "expired";
+
+export interface StateCheckResult {
+  verdict: StateCheckVerdict;
+  /** First failing rule code; null when the verdict is ok or no_state. */
+  reason: StateRule | null;
+  /** Blocks carried by the envelope, or the plan's count when ok; null when unreadable. */
+  observedBlocks: number | null;
+  expectedBlocks: number;
+  state: ParsedState | null;
+}
+
+/** Envelope heuristic only: not a signature, model identity, or quality check. */
+export function planBlocks(plan: Plan): number {
+  return plan === "team" ? 12 : 10;
+}
+
+/**
+ * Single plan-resolution table shared by the injection runtime and the Keeper
+ * observability check, so both always expect the same envelope size.
+ * Team-family plans (team/business/enterprise) use 12 blocks; free/plus/pro and
+ * any unrecognised or absent plan fall back to personal (10 blocks), marked
+ * `assumed_personal` because the plan was never confirmed. A manual
+ * `account_mode` override always wins over the account's own plan metadata.
+ */
+export function planForAccountMode(
+  accountMode: "auto" | "personal" | "team",
+  planType: string | null | undefined,
+): { plan: Plan; provenance: "account" | "override" | "assumed_personal" } {
+  if (accountMode !== "auto") return { plan: accountMode, provenance: "override" };
+  if (!planType || !["team", "business", "enterprise", "plus", "pro", "free"].includes(planType)) {
+    return { plan: "personal", provenance: "assumed_personal" };
+  }
+  return { plan: ["team", "business", "enterprise"].includes(planType) ? "team" : "personal", provenance: "account" };
+}
+
+/**
+ * Classify an opaque turn-state value against the reference rule set, reporting
+ * the first failing rule instead of a bare boolean so a rejection stays
+ * auditable. Rules and their order mirror the reference Go implementation
+ * (turnstate/token.go Parse + Policy.Accept).
+ */
+export function classifyState(value: unknown, plan: Plan, ttl: number, now: number): StateCheckResult {
+  const expectedBlocks = planBlocks(plan);
+  const fail = (
+    verdict: StateCheckVerdict,
+    reason: StateRule,
+    observedBlocks: number | null = null,
+  ): StateCheckResult => ({ verdict, reason, observedBlocks, expectedBlocks, state: null });
+  if (typeof value !== "string" || value === "") {
+    return { verdict: "no_state", reason: null, observedBlocks: null, expectedBlocks, state: null };
+  }
+  // Rule order mirrors the reference parser. Unlike the reference, whitespace is
+  // rejected on the raw value rather than after a TrimSpace: a state header never
+  // carries padding, so trimming could only turn a junk value into a usable one
+  // (i.e. weaken detection) — and a raw value is what gets re-injected verbatim.
+  if (value.length > 2048) return fail("invalid", "encoding_length");
+  if (/[\r\n\t ]/.test(value)) return fail("invalid", "encoding_whitespace");
+  const core = value.replace(/=+$/, "");
+  const padChars = value.length - core.length;
+  if (padChars > 2) return fail("invalid", "encoding_padding");
+  if (!/^[A-Za-z0-9_-]*$/.test(core)) return fail("invalid", "encoding_base64");
+  const raw = Buffer.from(core, "base64url");
+  // Strict base64url means canonical: a clean round-trip AND a pad count that
+  // rounds the value to a 4-char bound. The reference's RawURLEncoding drops
+  // padding characters before decoding, so it cannot see the second half —
+  // keeping it here is what legacy parseState callers already relied on.
+  if (raw.toString("base64url") !== core || (padChars > 0 && value.length % 4 !== 0)) {
+    return fail("invalid", "encoding_base64");
+  }
+  if (raw.length < 73) return fail("invalid", "envelope_too_short");
+  if (raw[0] !== 0x80) return fail("invalid", "envelope_version");
+  if ((raw.length - 57) % 16 !== 0) return fail("invalid", "envelope_structure");
+  const blocks = (raw.length - 57) / 16;
   const issuedSeconds = raw.readBigUInt64BE(1);
-  if (issuedSeconds < 1577836800n || issuedSeconds >= 4102444800n) return null;
+  if (issuedSeconds < 1577836800n || issuedSeconds >= 4102444800n) return fail("invalid", "timestamp_range", blocks);
   const issued = Number(issuedSeconds) * 1000;
   const expires = issued + ttl * 1000;
-  const blocks = (raw.length - 57) / 16;
-  if (blocks !== (plan === "team" ? 12 : 10) || issued > now + 30_000 || now >= expires - 30_000) return null;
-  return { value, length: value.length, blocks, fingerprint: digest(value).slice(0, 16), issued, expires };
+  if (issued > now + 30_000) return fail("invalid", "timestamp_future", blocks);
+  if (now >= expires - 30_000) return fail("expired", "expired", blocks);
+  if (blocks !== expectedBlocks) return fail("shape_mismatch", "block_mismatch", blocks);
+  return {
+    verdict: "ok",
+    reason: null,
+    observedBlocks: blocks,
+    expectedBlocks,
+    state: { value, length: value.length, blocks, fingerprint: digest(value).slice(0, 16), issued, expires },
+  };
+}
+
+/** Structural heuristic only: not a signature, model identity, or quality check. */
+export function parseState(value: unknown, plan: Plan, ttl: number, now: number): ParsedState | null {
+  return classifyState(value, plan, ttl, now).state;
 }
 
 export function isCompactionTrigger(input: unknown[]): boolean {

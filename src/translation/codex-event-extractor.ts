@@ -11,6 +11,7 @@ import {
   parseCodexEvent,
   type TypedCodexEvent,
 } from "../types/codex-events.js";
+import { observeUpstreamEvent } from "../proxy/upstream-observation.js";
 
 export interface UsageInfo {
   input_tokens: number;
@@ -133,6 +134,7 @@ export async function* iterateCodexEvents(
   const completedCustomToolCallIds = new Set<string>();
 
   for await (const raw of api.parseStream(rawResponse)) {
+    observeUpstreamEvent(rawResponse, raw.event, raw.data);
     const typed = parseCodexEvent(raw);
     const extracted: ExtractedEvent = { typed };
 

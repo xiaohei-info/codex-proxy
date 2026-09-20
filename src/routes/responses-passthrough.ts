@@ -12,6 +12,7 @@ import { EmptyResponseError } from "../translation/codex-event-extractor.js";
 import { reconvertTupleValues } from "../translation/tuple-schema.js";
 import { extractCodexError } from "../types/codex-events.js";
 import { recordStreamCloseEvent } from "../logs/stream-close-event.js";
+import { observeUpstreamEvent } from "../proxy/upstream-observation.js";
 import type {
   FormatAdapter,
   ResponseMetadata,
@@ -224,6 +225,7 @@ export async function* streamPassthrough(
       }
 
       const raw = next.value;
+      observeUpstreamEvent(response, raw.event, raw.data);
       responseId = extractResponseIdFromEventData(raw.data) ?? responseId;
       if (isTerminalResponsesEvent(raw.event)) sawTerminal = true;
       if (raw.event === "error" || raw.event === "response.failed") {
@@ -395,6 +397,7 @@ export async function collectPassthrough(
 
   try {
     for await (const raw of api.parseStream(response)) {
+      observeUpstreamEvent(response, raw.event, raw.data);
       const data = raw.data;
       if (!isRecord(data)) continue;
       const resp = isRecord(data.response) ? data.response : null;

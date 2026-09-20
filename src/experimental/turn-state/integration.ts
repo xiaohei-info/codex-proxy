@@ -9,6 +9,7 @@ import { hasReachedCachedQuota } from "../../auth/quota-skip.js";
 import { parseRateLimitHeaders, rateLimitToQuota } from "../../proxy/rate-limit-headers.js";
 import { trustedBaseUrl, scopeIdentity, stateMetadata, probeUsage, record, retryAfterSeconds } from "./protocol.js";
 import { digest } from "./policy.js";
+import { planForAccountMode } from "./policy.js";
 import { turnStateRuntime, type Scope, type ProbeResult } from "./runtime.js";
 
 export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, proxyPool: ProxyPool): void {
@@ -22,12 +23,10 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
     const proxy = unsupported ? null : proxyPool.resolveProxyUrl(entryId);
     const route = unsupported ? "auto_route_unsupported" : proxy === undefined ? getProxyUrl() : proxy;
     const mode = turnStateRuntime.config.account_mode;
-    const known = entry.planType && ["team", "business", "enterprise", "plus", "pro", "free"].includes(entry.planType);
-    const team = ["team", "business", "enterprise"].includes(entry.planType ?? "");
+    const { plan, provenance } = planForAccountMode(mode, entry.planType);
     return { entryId, model, unsupported, ...scopeIdentity(entry.token, entry.accountId, config.api.base_url, route),
       routeId: digest(JSON.stringify([routeSalt, config.api.base_url, route])).slice(0, 16), label: entry.label,
-      plan: mode === "auto" ? (team ? "team" : "personal") : mode,
-      provenance: mode !== "auto" ? "override" : known ? "account" : "assumed_personal" };
+      plan, provenance };
   };
   turnStateRuntime.update(getConfig().experimental_turn_state ?? {});
   turnStateRuntime.start(resolve, async (scope, signal, reserve): Promise<ProbeResult> => {
