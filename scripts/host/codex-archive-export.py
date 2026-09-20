@@ -10,7 +10,10 @@ import sys
 import uuid
 
 
-def export(db_path, directory, max_bytes=16 * 1024 * 1024):
+def export(db_path, directory, max_bytes=None):
+    if max_bytes is None:
+        max_bytes = int(os.environ.get('CODEX_EXPORT_MAX_BYTES', 128 * 1024 * 1024))
+    max_rows = int(os.environ.get('CODEX_EXPORT_MAX_ROWS', 2000))
     directory = Path(directory)
     if not directory.is_dir() or not os.access(directory, os.W_OK):
         raise RuntimeError("export directory must exist and be writable")
@@ -30,7 +33,7 @@ def export(db_path, directory, max_bytes=16 * 1024 * 1024):
         size = 0
         selected = []
         # One row at a time: memory ceiling is largest single record, not batch size.
-        rows = (db.execute('SELECT * FROM completed_requests WHERE id=?', (i,)).fetchone() for i in ids) if pending else db.execute('SELECT * FROM completed_requests WHERE created_at <= ? ORDER BY id LIMIT 500', (cutoff,))
+        rows = (db.execute('SELECT * FROM completed_requests WHERE id=?', (i,)).fetchone() for i in ids) if pending else db.execute('SELECT * FROM completed_requests WHERE created_at <= ? ORDER BY id LIMIT ?', (cutoff, max_rows))
         with open(temp, 'wb') as out:
             os.chmod(temp, 0o600)
             for row in rows:

@@ -2,11 +2,15 @@
 # Host-side bridge for the existing CPA tar/zstd/rclone archive chain.
 #
 # It deliberately does not compress or upload anything itself:
-#   1. ask Codex Proxy to export one age-qualified JSONL batch;
-#   2. stage that file beside CPA logs;
+#   1. export age-qualified JSONL batches until none remain (bounded per run);
+#   2. stage each batch beside CPA logs;
 #   3. run the existing cpa-log-archive pipeline;
 #   4. commit the exact batch receipt only after that pipeline succeeds;
 #   5. remove the exported source file only after commit succeeds.
+#
+# The loop matters: production arrival is ~82MB/h (~52 rows/h) while one 16MB
+# batch holds ~17 rows, so a single batch per run can never drain the backlog.
+# CODEX_MAX_BATCHES_PER_RUN bounds one execution.
 set -Eeuo pipefail
 
 : "${CODEX_PROXY_URL:=http://127.0.0.1:8088}"
@@ -14,22 +18,27 @@ set -Eeuo pipefail
 : "${CODEX_EXPORT_DIR:=/home/ubuntu/services/ai-gateway/codex-proxy/data/archive-export}"
 : "${CPA_LOG_DIR:=/home/ubuntu/services/ai-gateway/CLIProxyAPI/logs}"
 : "${CPA_ARCHIVER:=/usr/local/sbin/cpa-log-archive}"
-
 : "${CODEX_ARCHIVE_DB:?CODEX_ARCHIVE_DB is required}"
+: "${CODEX_EXPORTER:=$(dirname "$0")/codex-archive-export.py}"
+: "${CODEX_MAX_BATCHES_PER_RUN:=200}"
+
 # Fail closed unless the reviewed CPA contract patch is installed.
 grep -q '^# CPA_REMOTE_VERIFIED_V1$' "$CPA_ARCHIVER" || { echo "CPA verification patch required" >&2; exit 1; }
+
+# Same lock file the CPA archiver uses; inherited by CPA_INHERITED_LOCK below.
 exec 9>/tmp/cpa-log-archive.lock
 flock -n 9 || exit 0
 
-# Export outside the proxy process; helper writes the existing batch receipt.
-response="$(python3 "$(dirname "$0")/codex-archive-export.py" "$CODEX_ARCHIVE_DB" "$CODEX_EXPORT_DIR")"
+STAGE_DIR="${CPA_LOG_DIR}/codex-proxy"
 
-batch="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("batch")))' <<<"$response")"
-if [[ "$batch" == "null" ]]; then
-  exec env CPA_INHERITED_LOCK=1 "$CPA_ARCHIVER"
-fi
+committed=0
+for ((i = 1; i <= CODEX_MAX_BATCHES_PER_RUN; i++)); do
+  response="$(python3 "$CODEX_EXPORTER" "$CODEX_ARCHIVE_DB" "$CODEX_EXPORT_DIR")"
 
-readarray -t fields < <(python3 -c '
+  batch="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("batch")))' <<<"$response")"
+  [[ "$batch" == "null" ]] && break
+
+  readarray -t fields < <(python3 -c '
 import json,sys
 b=json.load(sys.stdin)
 for key in ("batch_id", "file_name", "row_count", "sha256"):
@@ -38,37 +47,37 @@ for key in ("batch_id", "file_name", "row_count", "sha256"):
         raise SystemExit(f"missing batch field: {key}")
     print(value)
 ' <<<"$batch")
-BATCH_ID="${fields[0]}"
-FILE_NAME="${fields[1]}"
-ROW_COUNT="${fields[2]}"
-SHA256="${fields[3]}"
+  BATCH_ID="${fields[0]}"
+  FILE_NAME="${fields[1]}"
+  ROW_COUNT="${fields[2]}"
+  SHA256="${fields[3]}"
 
-[[ "$FILE_NAME" =~ ^codex-proxy-requests-[0-9a-f-]+\.jsonl$ ]] || {
-  echo "invalid Codex archive file name" >&2
-  exit 1
-}
-SOURCE="${CODEX_EXPORT_DIR}/${FILE_NAME}"
-STAGE_DIR="${CPA_LOG_DIR}/codex-proxy"
-STAGE="${STAGE_DIR}/${FILE_NAME}"
-[[ -f "$SOURCE" ]] || { echo "Codex export file is missing: $SOURCE" >&2; exit 1; }
-[[ -d "$STAGE_DIR" && -w "$STAGE_DIR" && -r "$SOURCE" ]] || { echo "staging permissions/path invalid" >&2; exit 1; }
-rm -f -- "$STAGE"
-cp -p -- "$SOURCE" "$STAGE"
-actual_sha256="$(sha256sum "$STAGE" | awk '{print $1}')"
-[[ "$actual_sha256" == "$SHA256" ]] || {
-  echo "Codex export checksum mismatch before CPA archive" >&2
+  [[ "$FILE_NAME" =~ ^codex-proxy-requests-[0-9a-f-]+\.jsonl$ ]] || {
+    echo "invalid Codex archive file name" >&2
+    exit 1
+  }
+  SOURCE="${CODEX_EXPORT_DIR}/${FILE_NAME}"
+  STAGE="${STAGE_DIR}/${FILE_NAME}"
+  [[ -f "$SOURCE" ]] || { echo "Codex export file is missing: $SOURCE" >&2; exit 1; }
+  mkdir -p "$STAGE_DIR"
+  [[ -d "$STAGE_DIR" && -w "$STAGE_DIR" && -r "$SOURCE" ]] || { echo "staging permissions/path invalid" >&2; exit 1; }
   rm -f -- "$STAGE"
-  exit 1
-}
+  cp -p -- "$SOURCE" "$STAGE"
+  actual_sha256="$(sha256sum "$STAGE" | awk '{print $1}')"
+  [[ "$actual_sha256" == "$SHA256" ]] || {
+    echo "Codex export checksum mismatch before CPA archive" >&2
+    rm -f -- "$STAGE"
+    exit 1
+  }
 
-# CPA owns compression, remote upload, archive verification, and stage deletion.
-CPA_INHERITED_LOCK=1 "$CPA_ARCHIVER"
-[[ ! -e "$STAGE" ]] || {
-  echo "CPA archive completed without deleting Codex staged file" >&2
-  exit 1
-}
+  # CPA owns compression, remote upload, archive verification, and stage deletion.
+  CPA_INHERITED_LOCK=1 "$CPA_ARCHIVER"
+  [[ ! -e "$STAGE" ]] || {
+    echo "CPA archive completed without deleting Codex staged file" >&2
+    exit 1
+  }
 
-commit_body="$(python3 - "$BATCH_ID" "$FILE_NAME" "$ROW_COUNT" "$SHA256" <<'PY'
+  commit_body="$(python3 -c '
 import json,sys
 print(json.dumps({
     "batch_id": sys.argv[1],
@@ -76,21 +85,31 @@ print(json.dumps({
     "row_count": int(sys.argv[3]),
     "sha256": sys.argv[4],
 }))
-PY
-)"
-commit_response="$(curl --noproxy '*' --fail --silent --show-error \
-  -X POST "${CODEX_PROXY_URL%/}/admin/integration/keeper/archive/commit" \
-  -H "Authorization: Bearer ${CODEX_PROXY_TOKEN}" \
-  -H 'Content-Type: application/json' \
-  --data "$commit_body")"
+' "$BATCH_ID" "$FILE_NAME" "$ROW_COUNT" "$SHA256")"
 
-python3 -c '
+  commit_response="$(curl --noproxy '*' --fail --silent --show-error \
+    -X POST "${CODEX_PROXY_URL%/}/admin/integration/keeper/archive/commit" \
+    -H "Authorization: Bearer ${CODEX_PROXY_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    --data "$commit_body")"
+
+  python3 -c '
 import json,sys
 x=json.load(sys.stdin)
 if x.get("status") not in ("committed", "already_committed"):
     raise SystemExit(f"unexpected Codex archive commit response: {x}")
 ' <<<"$commit_response"
 
-# The JSONL source is retained until the remote archive and DB commit both pass.
-rm -f -- "$SOURCE"
-printf 'Codex archive committed: batch=%s rows=%s file=%s\n' "$BATCH_ID" "$ROW_COUNT" "$FILE_NAME"
+  # The JSONL source is retained until the remote archive and DB commit both pass.
+  rm -f -- "$SOURCE"
+  committed=$((committed + 1))
+  printf 'Codex archive committed: batch=%s rows=%s file=%s\n' "$BATCH_ID" "$ROW_COUNT" "$FILE_NAME"
+done
+
+if (( committed >= CODEX_MAX_BATCHES_PER_RUN )); then
+  echo "reached CODEX_MAX_BATCHES_PER_RUN=${CODEX_MAX_BATCHES_PER_RUN}; more batches remain" >&2
+fi
+
+# Ordinary CPA logs are archived by the same pipeline. Idempotent when the
+# per-batch iterations above already drained every eligible file.
+exec env CPA_INHERITED_LOCK=1 "$CPA_ARCHIVER"
