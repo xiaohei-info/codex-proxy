@@ -228,17 +228,22 @@ describe("E2E: POST /v1/chat/completions", () => {
 
   // ── Reasoning effort ──────────────────────────────────────────
 
-  it("reasoning_effort: forwarded to upstream", async () => {
+  it.each([
+    { reasoning_effort: "high" },
+    { reasoning_effort: "max" },
+    { reasoning_effort: "none" },
+    { reasoning_effort: "future-effort" },
+    { reasoning: { effort: "max" } },
+  ])("reasoning effort forwarded unchanged: %j", async (fields) => {
     setTransportPost(async () =>
       makeTransportResponse(buildReasoningStreamChunks("resp_chat_r", "thinking...", "Answer")),
     );
 
-    const res = await chatRequest(defaultBody({ reasoning_effort: "high" }));
+    const res = await chatRequest(defaultBody(fields));
     expect(res.status).toBe(200);
 
-    // Verify reasoning_effort was forwarded
     const sentBody = JSON.parse(getLastTransportBody()!);
-    expect(sentBody.reasoning?.effort).toBe("high");
+    expect(sentBody.reasoning?.effort).toBe(fields.reasoning_effort ?? fields.reasoning?.effort);
   });
 
   it("Cursor-style Responses payload: normalizes input and tools before forwarding", async () => {

@@ -252,6 +252,38 @@ describe("ChatCompletionRequestSchema", () => {
     expect(result.success).toBe(true);
   });
 
+  it.each(["low", "medium", "high", "xhigh", "max", "none", "future-effort"])("preserves reasoning effort %s in both input formats", (effort) => {
+    for (const fields of [{ reasoning_effort: effort }, { reasoning: { effort } }]) {
+      const result = ChatCompletionRequestSchema.parse({
+        model: "gpt-5.6-luna",
+        messages: [{ role: "user", content: "Hi" }],
+        ...fields,
+      });
+      expect(result.reasoning_effort).toBe(effort);
+    }
+  });
+
+  it.each(["", "   ", 123, null, {}, []])("rejects invalid reasoning effort %j in both input formats", (effort) => {
+    for (const fields of [{ reasoning_effort: effort }, { reasoning: { effort } }]) {
+      const result = ChatCompletionRequestSchema.safeParse({
+        model: "gpt-5.6-luna",
+        messages: [{ role: "user", content: "Hi" }],
+        ...fields,
+      });
+      expect(result.success).toBe(false);
+    }
+  });
+
+  it("trims effort and gives the flat field precedence over nested effort", () => {
+    const result = ChatCompletionRequestSchema.parse({
+      model: "gpt-5.6-luna",
+      messages: [{ role: "user", content: "Hi" }],
+      reasoning_effort: " max ",
+      reasoning: { effort: "high" },
+    });
+    expect(result.reasoning_effort).toBe("max");
+  });
+
   it("parses reasoning_effort", () => {
     const result = ChatCompletionRequestSchema.safeParse({
       model: "gpt-5.4",
