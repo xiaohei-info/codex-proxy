@@ -14,7 +14,8 @@ it("requires billing confirmation, posts full config and confines actions to sel
   vi.stubGlobal("fetch", fetcher);
   const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   render(<I18nProvider><TurnStateSettings /></I18nProvider>);
-  const active = await screen.findByLabelText("active_enabled");
+  await screen.findByText("Allow active probes");
+  const active = screen.getAllByRole("checkbox")[2];
   fireEvent.click(active);
   fireEvent.click(screen.getByText("Save configuration"));
   expect(confirm).toHaveBeenCalledOnce();
@@ -23,9 +24,9 @@ it("requires billing confirmation, posts full config and confines actions to sel
   fireEvent.click(screen.getByText("Save configuration"));
   await waitFor(() => expect(fetcher.mock.calls.filter(c => c[1]?.method === "POST")).toHaveLength(1));
   await screen.findByText("cleared");
-  fireEvent.input(screen.getByLabelText("entry_id"), { target: { value: "one-entry" } });
-  fireEvent.input(screen.getByLabelText("model"), { target: { value: "actual-model" } });
-  fireEvent.click(screen.getByText("probe"));
+  fireEvent.input(screen.getByLabelText("Account entry ID"), { target: { value: "one-entry" } });
+  fireEvent.input(screen.getByLabelText("Actual model ID"), { target: { value: "actual-model" } });
+  fireEvent.click(screen.getByText("Run one probe round"));
   await waitFor(() => expect(fetcher.mock.calls.filter(c => c[1]?.method === "POST")).toHaveLength(2));
   const actions = fetcher.mock.calls.filter(c => c[0].endsWith("action"));
   expect(JSON.parse(actions[0][1].body)).toEqual({ action: "probe", entry_id: "one-entry", model: "actual-model", confirmed: true });

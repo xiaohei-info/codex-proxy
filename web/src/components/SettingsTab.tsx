@@ -1,4 +1,5 @@
 import { GeneralSettings } from "./GeneralSettings";
+import { TurnStateSettings } from "./TurnStateSettings";
 import { LogsSettings } from "./LogsSettings";
 import { ModelAliasSettings } from "./ModelAliasSettings";
 import { OllamaBridgeSettings } from "./OllamaBridgeSettings";
@@ -23,6 +24,7 @@ export function SettingsTab(props: SettingsTabProps) {
       <RotationSettings />
       <LogsSettings />
       <OllamaBridgeSettings />
+      <TurnStateSettings />
     </div>
   );
 }

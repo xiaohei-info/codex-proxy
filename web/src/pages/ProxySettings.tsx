@@ -1,4 +1,3 @@
-import { TurnStateSettings } from "../components/TurnStateSettings";
 import { useState, useCallback } from "preact/hooks";
 import { useT } from "../../../shared/i18n/context";
 import { useProxyAssignments } from "../../../shared/hooks/use-proxy-assignments";
@@ -95,8 +94,6 @@ export function ProxySettings({ embedded }: { embedded?: boolean } = {}) {
           />
         </div>
       )}
-
-      <TurnStateSettings />
 
       {/* Main content */}
       <div class={embedded ? "" : "flex-grow px-4 md:px-8 lg:px-40 py-6"}>
