@@ -430,12 +430,6 @@ export function createSettingsRoutes(accountPool?: AccountPool): Hono {
         capacity: body.logs_capacity,
       });
     }
-    // Keep the in-memory byte budget aligned with config after any reload.
-    try {
-      logStore.setState({ maxBytes: getConfig().logs.max_bytes });
-    } catch {
-      // Config unavailable during early startup; defaults apply.
-    }
 
     const updated = getConfig();
     const restartRequired =

@@ -64,18 +64,12 @@ export interface LogQuery {
 }
 
 const DEFAULT_CAPACITY = 2000;
-/** Approximate heap budget for retained log records. The count-based capacity
- *  alone is unsafe when capture_body stores full prompts/responses: 2000 large
- *  records can exceed the container's V8 heap. Oldest records are evicted by
- *  either limit, whichever binds first. */
+/** Retained log budget: count alone is unsafe when records contain large bodies. */
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 
-/** Cheap size estimate for a record; bodies dominate, so measure those only. */
+/** Serialized UTF-8 size plus fixed overhead; an estimate, not V8 heap accounting. */
 function estimateRecordBytes(record: LogRecord): number {
-  let bytes = 256;
-  if (record.request !== undefined) bytes += JSON.stringify(record.request)?.length ?? 0;
-  if (record.response !== undefined) bytes += JSON.stringify(record.response)?.length ?? 0;
-  return bytes;
+  return 256 + Buffer.byteLength(JSON.stringify(record), "utf8");
 }
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -95,7 +89,7 @@ export class LogStore {
   private capacity: number;
   private maxBytes: number;
   private bytes = 0;
-  /** Per-record size estimates, kept in sync with `records` for O(1) eviction. */
+  /** Size bookkeeping stays separate from API-visible records. */
   private sizes = new WeakMap<LogRecord, number>();
   private enabled = true;
   private paused = false;
@@ -128,12 +122,11 @@ export class LogStore {
     if (typeof next.paused === "boolean") this.paused = next.paused;
     if (typeof next.maxBytes === "number" && Number.isFinite(next.maxBytes)) {
       this.maxBytes = Math.max(0, Math.trunc(next.maxBytes));
-      this.trimToCapacity();
     }
     if (typeof next.capacity === "number" && Number.isFinite(next.capacity)) {
       this.capacity = Math.max(1, Math.trunc(next.capacity));
-      this.trimToCapacity();
     }
+    this.trimToCapacity();
     return this.getState();
   }
 
@@ -232,16 +225,14 @@ export class LogStore {
       this.sizes.set(redacted, size);
       this.bytes += size;
       this.records.push(redacted);
+      this.trimToCapacity();
     }
-
-    this.trimToCapacity();
   }
 
   private trimToCapacity(): void {
     let evicted = 0;
     // Evict oldest until BOTH the count capacity and the byte budget are met.
-    while (this.records.length > this.capacity || this.bytes > this.maxBytes) {
-      if (this.records.length <= 1) break; // never drop the newest record
+    while (this.records.length > this.capacity || (this.maxBytes > 0 && this.bytes > this.maxBytes)) {
       const removed = this.records.shift();
       if (!removed) break;
       this.bytes = Math.max(0, this.bytes - (this.sizes.get(removed) ?? 0));

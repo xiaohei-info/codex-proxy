@@ -198,12 +198,10 @@ describe("LogStore byte budget", () => {
     await Promise.resolve();
 
     const state = store.getState();
-    expect(state.size).toBeLessThanOrEqual(3);
+    expect(state.size).toBe(2);
+    expect(state.dropped).toBe(3);
     expect(state.bytes).toBeLessThanOrEqual(state.maxBytes);
-    // newest survives, oldest evicted
-    const ids = store.list({ limit: 10, offset: 0 }).records.map((r) => r.id);
-    expect(ids).toContain("5");
-    expect(ids).not.toContain("1");
+    expect(store.list({}).records.map((r) => r.id)).toEqual(["5", "4"]);
   });
 
   it("still honours the count capacity independently", async () => {
@@ -211,6 +209,58 @@ describe("LogStore byte budget", () => {
     for (const id of ["1", "2", "3"]) store.enqueue(record(id, 1));
     await Promise.resolve();
     expect(store.getState().size).toBe(2);
+  });
+
+  it("disables byte eviction at zero while retaining the count limit", async () => {
+    const store = new LogStore(2, 0);
+    for (const id of ["1", "2", "3"]) store.enqueue(record(id, 40));
+    await Promise.resolve();
+    expect(store.list({}).records.map((r) => r.id)).toEqual(["3", "2"]);
+
+    store.setState({ maxBytes: 50 * 1024 });
+    expect(store.getState().size).toBe(1);
+    store.setState({ maxBytes: 0 });
+    store.enqueue(record("4", 40));
+    await Promise.resolve();
+    expect(store.list({}).records.map((r) => r.id)).toEqual(["4", "3"]);
+  });
+
+  it("drops a single oversized record rather than exceeding the budget", async () => {
+    const store = new LogStore(10, 1024);
+    store.enqueue(record("1", 40));
+    await Promise.resolve();
+    expect(store.getState()).toMatchObject({ size: 0, bytes: 0, dropped: 1 });
+  });
+
+  it("counts UTF-8 payloads and metadata toward the budget", async () => {
+    const store = new LogStore(10, 4096);
+    store.enqueue({ ...record("1", 0), request: { body: "汉".repeat(2000) } });
+    await Promise.resolve();
+    expect(store.getState().size).toBe(0);
+
+    store.enqueue({ ...record("2", 0), meta: { detail: "x".repeat(8192) } });
+    await Promise.resolve();
+    expect(store.getState()).toMatchObject({ size: 0, bytes: 0, dropped: 2 });
+  });
+
+  it("recounts response updates after redaction and evicts older records", async () => {
+    const store = new LogStore(10, 100 * 1024);
+    store.enqueue(record("1", 40));
+    store.enqueue(record("2", 40));
+    // updateByRequestId also flushes pending records before applying the patch.
+    expect(store.updateByRequestId("r2", {
+      response: { body: "y".repeat(40 * 1024), token: "secret-value" },
+    })).toBe(true);
+    expect(store.list({}).records.map((r) => r.id)).toEqual(["2"]);
+    expect(store.get("2")?.response).toMatchObject({ token: "sec***ue" });
+    const before = store.getState().bytes;
+    expect(before).toBeLessThanOrEqual(100 * 1024);
+
+    store.updateByRequestId("r2", { response: null });
+    expect(store.getState().bytes).toBeLessThan(before);
+    expect(store.updateByRequestId("missing", { response: bigBody(40) })).toBe(false);
+    await Promise.resolve();
+    expect(store.getState().size).toBe(1);
   });
 
   it("releases bytes on clear and shrinks when maxBytes is lowered", async () => {
