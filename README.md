@@ -46,6 +46,10 @@ docker build -t codex-proxy:keeper-local .
 
 将仓库 `docker-compose.yml` 的 `image` 改为 `codex-proxy:keeper-local`，再执行 `docker compose up -d`。修改归档配置后需重启服务。**上游镜像和桌面安装包不包含本分支新增功能；本分支目前采用源码构建。**
 
+## 实验性 Turn-State
+
+默认关闭；在代理设置中单独启用采集和计费主动探测。仅支持官方 OAuth 及固定/全局/直连出口；复用 WebSocket 不覆盖握手状态。状态、预算和暂停标记仅驻留内存，重启重置；Keeper 只读。启用前请阅读[行为、费用上限、暂停/恢复与回滚说明](./docs/EXPERIMENTAL_TURN_STATE.md)。
+
 ## 使用边界
 
 - 归档默认关闭，启用后只记录新请求；失败只能保留已收到的响应。客户端取消、路由预校验拒绝、捕获超限或进程崩溃等情况不保证有正文。

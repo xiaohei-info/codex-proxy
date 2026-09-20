@@ -8,6 +8,7 @@ data/
 /public/
 docs/*
 !docs/MULTI_AGENT_WORKFLOW.md
+!docs/EXPERIMENTAL_TURN_STATE.md
 bin/*
 !bin/README.md
 .env

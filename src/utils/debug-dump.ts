@@ -16,6 +16,8 @@
  * **Privacy warning:** the dump contains full request payloads (including
  * user prompts) and upstream response chunks. Treat the file as sensitive.
  */
+import { redactTurnStateJson } from "../experimental/turn-state/redact.js";
+import { turnStateRuntime } from "../experimental/turn-state/runtime.js";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,7 +41,10 @@ export function debugDump(kind: string, payload: Record<string, unknown>): void 
     console.warn(`[debug-dump] writing to ${DUMP_PATH} — file may contain sensitive request bodies`);
   }
   try {
-    const line = JSON.stringify({ ts: Date.now(), kind, ...payload }) + "\n";
+    // Chunk boundaries can bisect metadata keys and values; stateless regex redaction cannot secure them.
+    const safePayload = kind === "upstream-chunk" && turnStateRuntime.config.enabled && turnStateRuntime.config.mode !== "off"
+      ? { ...payload, chunk: "[experimental stream content withheld]" } : payload;
+    const line = redactTurnStateJson({ ts: Date.now(), kind, ...safePayload }) + "\n";
     fs.appendFileSync(DUMP_PATH, line);
   } catch {
     // never crash on dump errors

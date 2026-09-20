@@ -71,7 +71,7 @@ const ROTATABLE_ERROR_CODES: Readonly<Record<string, number>> = {
   server_error: 500,
 };
 
-function classifyWsErrorEvent(msg: Record<string, unknown>): { status: number } | null {
+export function classifyWsErrorEvent(msg: Record<string, unknown>): { status: number } | null {
   const type = typeof msg.type === "string" ? msg.type : "";
   if (type !== "error" && type !== "response.failed") return null;
   const errorObj = typeof msg.error === "object" && msg.error !== null
@@ -203,10 +203,13 @@ async function createPersistentWsConnection(opts: {
   entryId: string;
   poolKey: string;
   hooks: PersistentWsHooks;
+  onWire?: (kind: "new" | "reuse", dispatched?: boolean) => void;
 }): Promise<PersistentWs> {
   const WS = await getWS();
   const wsOpts = await buildWsConstructorOpts(WS, opts.headers, opts.proxyUrl);
+  opts.onWire?.("new");
   const ws = new WS(opts.wsUrl, wsOpts);
+  opts.onWire?.("new", true);
 
   // Construct PersistentWs first so its upgrade/error/close handlers attach
   // before the WebSocket handshake completes.
@@ -257,7 +260,9 @@ export async function createWebSocketResponse(
   proxyUrl?: string | null,
   onRateLimits?: (rl: ParsedRateLimit) => void,
   poolCtx?: WsPoolContext,
+  onWire?: (kind: "new" | "reuse", dispatched?: boolean) => void,
 ): Promise<Response> {
+  if (signal?.aborted) throw new Error("aborted");
   const previousResponseId = request.previous_response_id;
 
   if (previousResponseId) {
@@ -277,6 +282,7 @@ export async function createWebSocketResponse(
     }
     poolCtx.onDecision?.({ kind: "reuse", wsId: acquired.ws.id });
     try {
+      onWire?.("reuse", true);
       return await acquired.ws.send({ request, signal, onRateLimits, reused: true });
     } catch (err) {
       if (isPreviousResponseNotFoundError(err)) {
@@ -303,14 +309,19 @@ export async function createWebSocketResponse(
             entryId: deps.entryId,
             poolKey: deps.poolKey,
             hooks: deps.hooks,
+            onWire: (kind, dispatched) => {
+              if (signal?.aborted) throw new Error("aborted");
+              onWire?.(kind, dispatched);
+            },
           }),
       );
     } catch (err) {
+      if (err instanceof CodexApiError || signal?.aborted) throw err;
       // Only connection construction/acquisition errors reach this fallback.
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[ws-pool] acquire failed, using one-shot fallback: ${msg}`);
       poolCtx.onDecision?.({ kind: "bypass", reason: "factory_error" });
-      return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits);
+      return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits, onWire);
     }
 
     if ("ws" in acquired) {
@@ -319,13 +330,14 @@ export async function createWebSocketResponse(
         wsId: acquired.ws.id,
       });
       try {
+        if (acquired.reused) onWire?.("reuse", true);
         return await acquired.ws.send({ request, signal, onRateLimits, reused: acquired.reused });
       } catch (err) {
         // With full input and no previous_response_id, a pre-response failure
         // on a reused WS is safe to replay once on a fresh one-shot.
         if (err instanceof WsReusedConnectionError) {
           poolCtx.onDecision?.({ kind: "retry-after-stale-reuse", wsId: acquired.ws.id });
-          return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits);
+          return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits, onWire);
         }
         // Real upstream errors must propagate. They are not pool acquisition
         // failures and must never trigger a cross-WS replay.
@@ -337,7 +349,7 @@ export async function createWebSocketResponse(
     poolCtx.onDecision?.({ kind: "bypass", reason: acquired.bypass });
   }
 
-  return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits);
+  return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits, onWire);
 }
 
 async function openOneShotWs(
@@ -347,6 +359,7 @@ async function openOneShotWs(
   signal: AbortSignal | undefined,
   proxyUrl: string | null | undefined,
   onRateLimits: ((rl: ParsedRateLimit) => void) | undefined,
+  onWire?: (kind: "new" | "reuse", dispatched?: boolean) => void,
 ): Promise<Response> {
   const WS = await getWS();
   const wsOpts = await buildWsConstructorOpts(WS, headers, proxyUrl);
@@ -358,7 +371,9 @@ async function openOneShotWs(
       return;
     }
 
+    onWire?.("new");
     const ws = new WS(wsUrl, wsOpts);
+    onWire?.("new", true);
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
     let streamClosed = false;
     let earlyDecisionMade = false;
@@ -505,7 +520,7 @@ async function openOneShotWs(
     ws.on("message", (data: Buffer | string) => {
       if (streamClosed) return;
       const raw = typeof data === "string" ? data : data.toString("utf-8");
-      console.log(`[WS-Message] 📥 Frame received. Raw length: ${raw.length}, snippet: ${raw.slice(0, 120)}`);
+      console.log(`[WS-Message] 📥 Frame received. Raw length: ${raw.length}`);
 
       let msg: Record<string, unknown> | null = null;
       let type = "unknown";

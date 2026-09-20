@@ -9,6 +9,10 @@
  * (native rustls transport).
  */
 
+import { turnStateRuntime, type Attempt } from "../experimental/turn-state/runtime.js";
+import { isCompactionTrigger } from "../experimental/turn-state/policy.js";
+import { scopeIdentity, trustedBaseUrl, stateMetadata } from "../experimental/turn-state/protocol.js";
+import { getProxyUrl } from "../tls/proxy.js";
 import { getConfig } from "../config.js";
 import { createHash } from "crypto";
 import { getTransport, type TlsTransport } from "../tls/transport.js";
@@ -76,10 +80,13 @@ import {
 
 export interface CodexApiOptions {
   codexFingerprintMode?: CodexFingerprintMode;
+  experimentalTurnState?: boolean;
 }
 
 export class CodexApi {
   readonly tag = "codex" as const;
+  private experimentalTurnState = false;
+  private attempts = new WeakMap<Response, Attempt>();
 
   private token: string;
   private accountId: string | null;
@@ -100,6 +107,7 @@ export class CodexApi {
     transport?: TlsTransport,
     options?: CodexApiOptions,
   ) {
+    this.experimentalTurnState = options?.experimentalTurnState === true;
     this.token = token;
     this.accountId = accountId;
     this.cookieJar = cookieJar ?? null;
@@ -272,9 +280,35 @@ export class CodexApi {
     onRateLimits?: (rl: ParsedRateLimit) => void,
     poolCtx?: WsPoolContext,
   ): Promise<Response> {
+    const base = this.resolveBaseUrl();
+    const scope = this.experimentalTurnState && this.entryId && trustedBaseUrl(base) && !isCompactionTrigger(request.input)
+      ? turnStateRuntime.resolveScope(this.entryId, request.model) : null;
+    const route = this.proxyUrl === undefined ? getProxyUrl() : this.proxyUrl;
+    const attempt = scope && (scope.unsupported || scope.identity === scopeIdentity(this.token, this.accountId, base, route).identity)
+      ? turnStateRuntime.begin(scope, request.turnState) : null;
+    if (attempt?.value) request = { ...request, turnState: attempt.value };
+    let reused = false;
+    const wire = (kind: "http" | "new" | "reuse", dispatched?: boolean) => {
+      reused = kind === "reuse";
+      if (attempt?.strictMissing && !reused) throw new CodexApiError(400, "experimental_turn_state_missing");
+      try { if (dispatched) attempt?.wire(kind); } catch { /* diagnostics cannot interrupt business dispatch */ }
+    };
+    const response = await this.dispatchResponse(request, signal, onRateLimits, poolCtx, wire);
+    if (attempt) {
+      // A reused socket's upgrade header belongs to an earlier response. Body metadata remains authoritative.
+      if (!reused) attempt.observe(response.headers.get("x-codex-turn-state") ?? undefined);
+      this.attempts.set(response, { ...attempt, complete: () => { if (!signal?.aborted) attempt.complete(); } });
+    }
+    return response;
+  }
+
+  private async dispatchResponse(
+    request: CodexResponsesRequest, signal?: AbortSignal, onRateLimits?: (rl: ParsedRateLimit) => void,
+    poolCtx?: WsPoolContext, wire?: (kind: "http" | "new" | "reuse", dispatched?: boolean) => void,
+  ): Promise<Response> {
     if (request.useWebSocket) {
       try {
-        return await this.createResponseViaWebSocket(request, signal, onRateLimits, poolCtx);
+        return await this.createResponseViaWebSocket(request, signal, onRateLimits, poolCtx, wire);
       } catch (err) {
         // Real upstream API errors classified by ws-transport (e.g.
         // usage_limit_reached → CodexApiError(429)) must reach the
@@ -292,10 +326,10 @@ export class CodexApi {
         }
         console.warn(`[CodexApi] WebSocket failed (${msg}), falling back to HTTP SSE`);
         const { previous_response_id: _, useWebSocket: _ws, ...httpRequest } = request;
-        return this.createResponseViaHttp(httpRequest as CodexResponsesRequest, signal);
+        return this.createResponseViaHttp(httpRequest as CodexResponsesRequest, signal, dispatched => wire?.("http", dispatched));
       }
     }
-    return this.createResponseViaHttp(request, signal);
+    return this.createResponseViaHttp(request, signal, dispatched => wire?.("http", dispatched));
   }
 
   /**
@@ -308,6 +342,7 @@ export class CodexApi {
     signal?: AbortSignal,
     onRateLimits?: (rl: ParsedRateLimit) => void,
     poolCtx?: WsPoolContext,
+    wire?: (kind: "new" | "reuse", dispatched?: boolean) => void,
   ): Promise<Response> {
     const baseUrl = this.resolveBaseUrl();
     const wsUrl = baseUrl.replace(/^https?:/, "wss:") + "/codex/responses";
@@ -357,7 +392,7 @@ export class CodexApi {
       identity.windowId,
     );
 
-    return createWebSocketResponse(wsUrl, headers, wsRequest, signal, this.proxyUrl, onRateLimits, poolCtx);
+    return createWebSocketResponse(wsUrl, headers, wsRequest, signal, this.proxyUrl, onRateLimits, poolCtx, wire);
   }
 
   /**
@@ -367,6 +402,7 @@ export class CodexApi {
   private async createResponseViaHttp(
     request: CodexResponsesRequest,
     signal?: AbortSignal,
+    beforeDispatch?: (dispatched?: boolean) => void,
   ): Promise<Response> {
     const transport = this.resolveTransport();
     const baseUrl = this.resolveBaseUrl();
@@ -425,8 +461,12 @@ export class CodexApi {
     const body = JSON.stringify(bodyWithMetadata);
 
     let transportRes;
+    if (signal?.aborted) throw new Error("aborted");
+    beforeDispatch?.();
     try {
-      transportRes = await transport.post(url, headers, body, signal, undefined, this.proxyUrl);
+      const pending = transport.post(url, headers, body, signal, undefined, this.proxyUrl);
+      beforeDispatch?.(true);
+      transportRes = await pending;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new CodexApiError(0, msg);
@@ -538,7 +578,27 @@ export class CodexApi {
    * Delegates to the standalone parseSSEStream() function.
    */
   async *parseStream(response: Response): AsyncGenerator<CodexSSEEvent> {
-    yield* parseSSEStream(response);
+    const attempt = this.attempts.get(response);
+    this.attempts.delete(response);
+    let failed = false;
+    for await (const event of parseSSEStream(response)) {
+      try {
+        const data = event.data as { type?: string; response?: { status?: string } } | null;
+        const type = event.event || data?.type;
+        if (type === "error" || type === "response.failed" || type === "response.incomplete") failed = true;
+        if (type === "codex.response.metadata") attempt?.observe(stateMetadata(data));
+        if (type === "response.completed" && !failed && (!data?.response?.status || data.response.status === "completed")) attempt?.complete();
+      } catch { /* observer failure must not fail successful business output */ }
+      yield event;
+    }
+  }
+
+  /** Isolated active probe: HTTP only, no recursive observer, reserve on actual dispatch. */
+  createProbeResponse(request: CodexResponsesRequest, signal: AbortSignal, reserve: () => boolean): Promise<Response> {
+    return this.createResponseViaHttp(request, signal, dispatched => {
+      if (dispatched) return;
+      if (signal.aborted || !reserve()) throw new Error("probe_not_dispatched");
+    });
   }
 }
 
