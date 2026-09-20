@@ -1,3 +1,60 @@
+# Codex Proxy · Keeper Edition
+
+**Keep your proxy. Add request history and a usage dashboard.**
+
+A community fork of [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy), retaining its multi-protocol gateway, account rotation and proxy management. Pair it with [CPA Usage Keeper · Codex Edition](https://github.com/xiaohei-info/cpa-usage-keeper) to explore usage and investigate requests.
+
+[简体中文](./README.md) · [Companion dashboard](https://github.com/xiaohei-info/cpa-usage-keeper) · [Report an issue](https://github.com/xiaohei-info/codex-proxy/issues)
+
+## What's new
+
+| Feature | What you get |
+| --- | --- |
+| Request history | Request/response bodies for successful and failed requests across OpenAI, Anthropic, Gemini, image and direct-provider paths |
+| Keeper integration | Continuous usage collection for request counts, tokens, cache use, success rates, latency and estimated costs |
+| Account observations | Account identities, status and observed upstream quotas in Keeper, without exporting account credentials |
+| Optional cold storage | UTF-8 JSONL export into an existing CPA archive pipeline, retaining usage statistics after bodies are moved |
+| Reliability fixes | Log byte budgets, bounded stream capture, preserved reasoning tokens and a fix for internal parameters leaking into upstream requests |
+
+## Get started
+
+Follow the [Keeper quick start](https://github.com/xiaohei-info/cpa-usage-keeper#quick-start) to build and run both forks together. Its Compose example connects the two containers.
+
+Create `data/` if needed and **merge**, rather than overwrite, these settings into `data/local.yaml`. Replace the example key with a privately generated random value:
+
+```yaml
+server:
+  proxy_api_key: "replace-with-a-long-random-key"
+archive:
+  enabled: true
+  max_response_bytes: 4194304
+  max_inflight_bytes: 33554432
+logs:
+  max_bytes: 67108864
+```
+
+Use the same key for Keeper's `CODEX_PROXY_TOKEN`. After startup, add your accounts at `http://localhost:8080`; the dashboard is at `http://localhost:8318`. Restart the proxy after changing archive settings.
+
+For a standalone proxy, clone branch `keeper-integration` from this repository, copy `.env.example` to `.env`, run `docker build -t codex-proxy:keeper-local .`, change the Compose service image to that local image, and run `docker compose up -d`.
+
+**Build this fork from source. Upstream images and desktop releases do not include these additions.**
+
+## Before enabling capture
+
+- Capture is opt-in and applies to new requests. Failed responses can only contain bytes actually received; cancellation, pre-validation rejection, capture limits or crashes may leave no body.
+- Writes happen at request termination, not per chunk. Credential headers are filtered, but **bodies can contain sensitive data**. Protect storage, backups and management access; use HTTPS across hosts.
+- Quotas are observed upstream values, not token-derived estimates. Keeper costs use configured model prices, not provider invoices.
+- [Cold storage](./scripts/host/README.md) needs separate host setup. It is not an automatic cloud backup; moved bodies are no longer available through Keeper.
+
+## Upstream and license
+
+Credit remains with the upstream authors and contributors. This fork retains Codex Proxy's **Non-Commercial** terms: personal learning, research and self-hosted use only; no paid proxy services or other commercial use. The separate Keeper project retains its MIT license.
+
+<details>
+<summary>Original upstream features, client setup and full documentation</summary>
+
+> Download, image and release links below refer to upstream artifacts, not this fork's added features.
+
 <div align="center">
 
   <h1>Codex Proxy</h1>
@@ -935,3 +992,5 @@ Not affiliated with OpenAI. Users assume all risks and must comply with OpenAI's
 <div align="center">
   <sub>Built with Hono + TypeScript | Powered by Codex Desktop API</sub>
 </div>
+
+</details>

@@ -1,3 +1,67 @@
+# Codex Proxy · Keeper 集成版
+
+**代理照常用，请求有记录，用量有仪表盘。**
+
+基于 [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy) 的社区衍生版本。在原有多协议接入、账号轮换和代理管理之上，新增请求归档，并可搭配 [CPA Usage Keeper · Codex 集成版](https://github.com/xiaohei-info/cpa-usage-keeper) 查看用量仪表盘。
+
+[English](./README_EN.md) · [配套仪表盘](https://github.com/xiaohei-info/cpa-usage-keeper) · [反馈问题](https://github.com/xiaohei-info/codex-proxy/issues)
+
+## 相比上游，新增了什么
+
+| 新功能 | 能帮你做什么 |
+| --- | --- |
+| 请求留痕 | 保存请求与响应正文，排查成功和失败请求；覆盖 OpenAI、Anthropic、Gemini、图片及直连代理路径 |
+| Keeper 仪表盘接入 | 持续同步用量，在配套 Keeper 中查看请求量、Token、缓存、成功率、延迟和估算成本 |
+| 账号与额度同步 | 向 Keeper 提供账号身份、状态及已有的上游额度快照，不导出账号凭证 |
+| 历史正文转存 | 可选导出为 UTF-8 JSONL，接入已有 CPA 压缩上传链路；转存后保留统计数据 |
+| 稳定性与数据修复 | 增加日志内存预算和流式捕获上限，修复推理 Token 丢失及内部参数导致的上游 400 |
+
+## 开始使用
+
+**推荐两个项目一起部署：**按 [Keeper 中文启动指南](https://github.com/xiaohei-info/cpa-usage-keeper/blob/codex-integration/README.zh.md#快速开始) 从源码构建并启动，Compose 示例已配置两边的容器网络。
+
+先在本项目的 `data/local.yaml` 中合并以下配置（没有 `data` 目录时先创建）。**已有配置不要覆盖**；使用自己生成的随机密钥，不要照搬示例值：
+
+```yaml
+server:
+  proxy_api_key: "replace-with-a-long-random-key"
+archive:
+  enabled: true
+  max_response_bytes: 4194304
+  max_inflight_bytes: 33554432
+logs:
+  max_bytes: 67108864
+```
+
+Keeper 的 `CODEX_PROXY_TOKEN` 填写相同的 `proxy_api_key`。代理启动后，在 `http://localhost:8080` 登录并添加账号；仪表盘默认在 `http://localhost:8318`。
+
+只需要代理时，也可以独立构建本分支：
+
+```bash
+git clone --branch keeper-integration https://github.com/xiaohei-info/codex-proxy.git
+cd codex-proxy
+cp .env.example .env
+docker build -t codex-proxy:keeper-local .
+```
+
+将仓库 `docker-compose.yml` 的 `image` 改为 `codex-proxy:keeper-local`，再执行 `docker compose up -d`。修改归档配置后需重启服务。**上游镜像和桌面安装包不包含本分支新增功能；本分支目前采用源码构建。**
+
+## 使用边界
+
+- 归档默认关闭，启用后只记录新请求；失败只能保留已收到的响应。客户端取消、路由预校验拒绝、捕获超限或进程崩溃等情况不保证有正文。
+- 请求终态统一写盘，不逐 chunk 写盘。凭证类请求头会过滤，**正文仍可能包含敏感内容**，请保护数据目录、备份和管理接口，跨主机访问使用 HTTPS。
+- 额度是上游观察值，不按 Token 推算；成本由 Keeper 按配置价格估算，不是供应商账单。
+- [历史转存工具](./scripts/host/README.md) 需单独配置，不会默认上传。转存完成后，Keeper 不再提供这些历史正文的在线查询。
+
+## 上游与许可
+
+感谢原项目作者与贡献者。本分支保留上游署名及**非商业许可**，仅供个人学习、研究和自用部署，不授权收费代理或其他商业用途。Keeper 使用其自身的 MIT 许可；两者独立运行。
+
+<details>
+<summary>展开上游功能、客户端接入与完整使用文档</summary>
+
+> 以下保留原项目文档；其中安装包、镜像和发布链接指向上游，不包含本分支新增功能。
+
 <div align="center">
 
   <h1>Codex Proxy</h1>
@@ -1208,3 +1272,5 @@ Codex Proxy 最初只是一个个人自用项目，一路走来收获了超乎�
 <div align="center">
   <sub>Built with Hono + TypeScript + Rust | Powered by Codex Desktop API</sub>
 </div>
+
+</details>
