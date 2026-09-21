@@ -18,6 +18,7 @@ import { CodexApi } from "@src/proxy/codex-api.js";
 import { WsConnectionPool } from "@src/proxy/ws-pool.js";
 import { turnStateRuntime as runtime, type Scope } from "@src/experimental/turn-state/runtime.js";
 import { scopeIdentity } from "@src/experimental/turn-state/protocol.js";
+import { digest } from "@src/experimental/turn-state/policy.js";
 import type { TlsTransport } from "@src/tls/transport.js";
 const base = "https://chatgpt.com/backend-api";
 const scope: Scope = { entryId: "entry", model: "upstream-model", ...scopeIdentity("credential", null, base, null), routeId: "route", label: null, plan: "personal", provenance: "account" };
@@ -94,7 +95,17 @@ describe("turn-state actual transport seams", () => {
       await drain(a, await second);
       expect(runtime.overview().summary.injection_count).toBe(baseline);
       expect(runtime.overview().sessions[0].ws_connection_reused).toBe(1);
-      expect(runtime.begin(scope, undefined)?.value).toBe(returned);
+      // Saving a setting mid-session must not discard what is already cached. The socket's own
+      // state therefore stays active and the state learned from this response is staged as the
+      // next one, which `promote` swaps in once the active state nears expiry. Asserting the
+      // staging is what proves the body metadata was captured at all.
+      const learned = runtime.overview().sessions[0].ready;
+      const active = runtime.overview().sessions[0].active;
+      expect(learned).not.toBeNull();
+      expect(learned!.fingerprint).toBe(digest(returned).slice(0, 16));
+      expect(active!.fingerprint).toBe(digest(cached).slice(0, 16));
+      expect(learned!.fingerprint).not.toBe(active!.fingerprint);
+      expect(runtime.begin(scope, undefined)?.value).toBe(cached);
       expect(runtime.overview().events.some(e => e.result === "ws_connection_reused")).toBe(true);
     } finally { pool.shutdown(); }
   });

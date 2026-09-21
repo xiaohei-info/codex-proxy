@@ -156,9 +156,19 @@ export class TurnStateRuntime {
   update(config: unknown): void {
     const parsed = TurnStateConfigSchema.parse(config);
     if (JSON.stringify(parsed) === JSON.stringify(this.config)) return;
+    const previous = this.config;
     this.configEpoch++;
     this.invalidate();
-    for (const s of this.sessions.values()) { s.active = null; s.ready = null; s.businessUntil = 0; }
+    // Saving a setting must not throw away a state the operator already collected. Only a change
+    // to what "acceptable" means does that: the lifetime the expiry was measured against, the
+    // plan whose block count the envelope must match, and the policy that decides whether a
+    // substituted model counts. Runtime knobs (cooldown, timeout, egress, revalidate) and the
+    // injection switches all leave the cached states intact.
+    if (previous.ttl_seconds !== parsed.ttl_seconds
+      || previous.account_mode !== parsed.account_mode
+      || previous.mismatch_is_success !== parsed.mismatch_is_success) {
+      for (const s of this.sessions.values()) { s.active = null; s.ready = null; }
+    }
     this.config = parsed;
     for (const s of this.sessions.values()) {
       const scope = this.resolve?.(s.scope.entryId, s.scope.model);
@@ -816,6 +826,44 @@ export class TurnStateRuntime {
     this.event(s, "lifecycle", action, s.diagnostic);
     return s.diagnostic;
   }
+  /**
+   * The scopes the ticket layer covers: only a personal envelope can be judged as a ticket, so
+   * team-family plans keep using the generic probe for active collection.
+   */
+  private ticketCovered(scope: Scope): boolean {
+    return scope.plan === "personal" && !scope.unsupported;
+  }
+  /** Whether an authentic, unexpired ticket already exists for this exact dispatch identity. */
+  private ticketReady(scope: Scope): boolean {
+    return ticketStore.usable(scope.entryId, scope.model, ticketBinding(scope), this.now()) !== null;
+  }
+  /**
+   * One automatic collection for a scope, run by the scheduler.
+   *
+   * Exactly one mechanism runs per scope per round — the ticket layer where it covers the scope,
+   * the generic probe otherwise — so the shared dispatch budget is never spent twice on the same
+   * state. Driving only the generic probe here is what left `harvest` reachable solely from the
+   * admin action, and so left every ticket store empty.
+   */
+  private collect(s: Session): void {
+    // The ticket layer is only a collection mechanism once its egress is wired. Without it the
+    // generic probe is the only thing that can actually dispatch, so a deployment that never
+    // binds the ticket transports still collects instead of spinning on a missing transport.
+    if (this.ticketCovered(s.scope) && this.harvestTransport) {
+      // A ticket round carries no cadence of its own (it is also driven by `refreshTickets`), so
+      // the slot is reserved before dispatching: without it the next 15s tick would restart the
+      // same failing round until the hourly budget is gone.
+      s.nextProbe = this.now() + this.config.cooldown_seconds * 1000;
+      void this.harvest(s.scope.entryId, s.scope.model).then(code => {
+        if (!this.current(s)) return;
+        const verified = code === "ticket_verified";
+        s.failures = verified ? 0 : Math.min(6, s.failures + 1);
+        if (!verified) s.nextProbe = Math.max(s.nextProbe, this.now() + Math.min(3600, this.config.cooldown_seconds * 2 ** s.failures) * 1000);
+      });
+      return;
+    }
+    void this.probe(s.scope.entryId, s.scope.model);
+  }
   tick(): void {
     // Ticket refresh is its own decision layer: it runs whether or not generic mode is enabled.
     this.refreshTickets();
@@ -828,9 +876,15 @@ export class TurnStateRuntime {
       }
       this.promote(s);
       if (!s.stopped && !s.task && s.nextProbe <= this.now() && s.businessUntil + 3600_000 < this.now()) { this.sessions.delete(key); continue; }
-      if (this.config.active_enabled && !s.stopped && !isProbeExcluded(s.scope.model) && s.businessUntil > this.now() && s.nextProbe <= this.now()
-        && (!this.usable(s.active) || s.active.expires - this.now() <= this.config.refresh_before_seconds * 1000)
-        && !this.usable(s.ready)) void this.probe(s.scope.entryId, s.scope.model);
+      if (!this.config.active_enabled || s.stopped || isProbeExcluded(s.scope.model)) continue;
+      // Background collection only runs for a scope that has seen business traffic recently and
+      // is not already inside its cooldown.
+      if (s.businessUntil <= this.now() || s.nextProbe > this.now()) continue;
+      // Nothing to collect while a fresh state, or a usable backup, is already on hand.
+      if (this.usable(s.ready)) continue;
+      if (this.usable(s.active) && s.active.expires - this.now() > this.config.refresh_before_seconds * 1000) continue;
+      if (this.ticketCovered(s.scope) && this.ticketReady(s.scope)) continue;
+      this.collect(s);
     }
   }
   overview() {
