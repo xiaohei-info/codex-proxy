@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { TurnStateConfigSchema, classifyState, parseState, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
+import { TurnStateConfigSchema, classifyState, isProbeExcluded, parseState, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
+import { safeModelName } from "./protocol.js";
 
 export interface Scope {
   entryId: string;
@@ -28,12 +29,27 @@ export interface ProbeStateCheck {
 }
 export interface ProbeResult { value?: string; completed: boolean; model?: string; modelMismatch?: boolean; status?: number; retryAfter?: number; usage?: ProbeUsage; stateCheck?: ProbeStateCheck }
 export type ProbeTransport = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
+/**
+ * Why the most recent probe/observation did not pass. Kept per session so Keeper can
+ * explain a rejection without re-deriving it from the event stream.
+ */
+export interface SessionFailure {
+  code: string;
+  reason: string | null;
+  verdict: StateCheckVerdict | null;
+  observed_blocks: number | null;
+  expected_blocks: number | null;
+}
 interface State extends ParsedState { version: number }
 interface Session {
   scope: Scope; generation: number; active: State | null; ready: State | null; revision: number; sequence: number;
   businessUntil: number; stopped: boolean; nextProbe: number; failures: number;
   injectionCount: number; observationCount: number; probeCount: number; reusedCount: number;
   diagnostic: string | null; lastObserved: number | null; lastInjected: number | null;
+  /** Real upstream model the last observation reported, and whether it differed from the request. */
+  lastUpstreamModel: string | null; modelMismatch: boolean;
+  /** Result code of the most recent probe/observation, and its failure detail when it failed. */
+  lastResult: string | null; lastFailure: SessionFailure | null;
   task?: Promise<string>; abort?: AbortController;
 }
 interface Guard { identity: string; blocked: boolean; authOrder: number; until: number }
@@ -46,6 +62,10 @@ interface Event {
   /** Envelope shape of the candidate: enough for the UI to explain block_mismatch. */
   observed_blocks: number | null;
   expected_blocks: number | null;
+  /** Real upstream model for this event; null when unobserved. */
+  upstream_model: string | null;
+  /** `classifyState` verdict for this event; null when the event carries no candidate. */
+  verdict: StateCheckVerdict | null;
   route_id: string | null; usage: ProbeUsage | null;
 }
 export interface Attempt {
@@ -135,7 +155,8 @@ export class TurnStateRuntime {
         this.sessions.delete(idle[0]);
       }
       s = { scope, generation: 0, active: null, ready: null, revision: 0, sequence: 0, businessUntil: 0, stopped: prior?.stopped ?? false, nextProbe: prior?.nextProbe ?? 0, failures: prior?.failures ?? 0,
-        injectionCount: 0, observationCount: 0, probeCount: 0, reusedCount: 0, diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null };
+        injectionCount: 0, observationCount: 0, probeCount: 0, reusedCount: 0, diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null,
+        lastUpstreamModel: null, modelMismatch: false, lastResult: null, lastFailure: null };
       this.sessions.set(key, s);
     }
     s.scope = scope;
@@ -184,12 +205,12 @@ export class TurnStateRuntime {
    * Publish an observation. Returns the outcome and, on rejection, the first failing rule so the
    * caller can report the same reason the audit event carries.
    */
-  private publish(s: Session, candidate: unknown, revision: number, source: "passive" | "active", usage?: ProbeUsage, modelMismatch?: boolean): { accepted: boolean; code: string; reason: string | null; observedBlocks: number | null; expectedBlocks: number } {
+  private publish(s: Session, candidate: unknown, revision: number, source: "passive" | "active", usage?: ProbeUsage, modelMismatch?: boolean, upstreamModel?: string | null): { accepted: boolean; code: string; reason: string | null; observedBlocks: number | null; expectedBlocks: number } {
     const classified = classifyState(candidate, s.scope.plan, this.config.ttl_seconds, this.now());
     const state = classified.state;
     const blocks = { observedBlocks: classified.observedBlocks, expectedBlocks: classified.expectedBlocks };
     if (revision < s.revision) {
-      this.event(s, source, "discard", "stale_observation", null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks);
+      this.event(s, source, "discard", "stale_observation", null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks, upstreamModel, classified.verdict);
       return { accepted: false, code: "stale_observation", reason: classified.reason, ...blocks };
     }
     s.revision = revision;
@@ -199,10 +220,14 @@ export class TurnStateRuntime {
       // auditable; `no_state` has no failing rule, so its verdict is the code.
       const reason = classified.reason ?? classified.verdict;
       s.diagnostic = reason;
-      this.event(s, source, "reject", reason, null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks);
+      this.outcome(s, reason, { code: reason, reason: classified.reason, verdict: classified.verdict,
+        observed_blocks: classified.observedBlocks, expected_blocks: classified.expectedBlocks });
+      this.event(s, source, "reject", reason, null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks, upstreamModel, classified.verdict);
       return { accepted: false, code: reason, reason: classified.reason, ...blocks };
     }
     if (s.active && state.issued < s.active.issued) {
+      this.outcome(s, "stale_observation", { code: "stale_observation", reason: null, verdict: classified.verdict,
+        observed_blocks: classified.observedBlocks, expected_blocks: classified.expectedBlocks });
       return { accepted: false, code: "stale_observation", reason: null, ...blocks };
     }
     const accepted = { ...state, version: revision };
@@ -213,17 +238,25 @@ export class TurnStateRuntime {
     // A model mismatch is observational: the envelope passed every structural rule, so it is
     // accepted, and the event still records that the upstream served a different model.
     const code = modelMismatch ? "accepted_model_mismatch" : "accepted";
-    this.event(s, source, "accept", code, accepted, usage, null, state.blocks, classified.expectedBlocks);
+    this.outcome(s, code, null);
+    this.event(s, source, "accept", code, accepted, usage, null, state.blocks, classified.expectedBlocks, upstreamModel, classified.verdict);
     return { accepted: true, code, reason: null, observedBlocks: state.blocks, expectedBlocks: classified.expectedBlocks };
   }
-  private event(s: Session, source: Event["source"], action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage, reason?: string | null, observedBlocks?: number | null, expectedBlocks?: number | null): void {
+  private event(s: Session, source: Event["source"], action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage, reason?: string | null, observedBlocks?: number | null, expectedBlocks?: number | null, upstreamModel?: string | null, verdict?: StateCheckVerdict | null): void {
     this.events.push({ id: randomUUID(), at: iso(this.now())!, entry_id: s.scope.entryId, model: s.scope.model,
       source, action, result, length: state?.length ?? null, blocks: state?.blocks ?? null,
       reason: reason ?? null,
       observed_blocks: observedBlocks ?? state?.blocks ?? null,
       expected_blocks: expectedBlocks ?? null,
+      upstream_model: upstreamModel ?? null,
+      verdict: verdict ?? null,
       route_id: s.scope.routeId, usage: usage ?? null });
     if (this.events.length > 200) this.events.shift();
+  }
+  /** Record the most recent probe/observation outcome for the session status card. */
+  private outcome(s: Session, code: string, failure: SessionFailure | null): void {
+    s.lastResult = code;
+    s.lastFailure = failure;
   }
   private budgetTimes(entryId: string): number[] {
     const now = this.now();
@@ -258,6 +291,9 @@ export class TurnStateRuntime {
   }
   async probe(entryId: string, model: string): Promise<string> {
     if (!this.enabled() || !this.config.active_enabled) return "disabled";
+    // Probe-boundary exclusion: no dispatch, no upstream request, no budget consumption.
+    // The session still exists so business injection and passive collection keep working.
+    if (isProbeExcluded(model)) return "excluded";
     const scope = this.resolve?.(entryId, model);
     if (!scope) return "ineligible";
     const s = this.session(scope);
@@ -313,17 +349,30 @@ export class TurnStateRuntime {
             this.guards.set(entryId, guard);
             resultCode = auth ? "auth_blocked" : "quota_blocked";
             this.counts.rejected_probes++;
+            this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: null, observed_blocks: null, expected_blocks: null });
             this.event(s, "active", "reject", resultCode, null, result.usage);
             break;
           }
           if (controller.signal.aborted || generation !== this.generation || scopeGeneration !== s.generation || !this.current(s)) { resultCode = "cancelled"; break; }
-          if (!result.completed) resultCode = "incomplete";
-          else {
+          if (typeof result.model === "string" && result.model !== "") {
+            // Sanitize before it can reach the snapshot: Keeper's whitelist decoder
+            // rejects a model name over 256 chars or containing CR/LF/NUL.
+            const disclosed = safeModelName(result.model);
+            if (disclosed !== null) {
+              s.lastUpstreamModel = disclosed;
+              s.modelMismatch = disclosed !== s.scope.model;
+            }
+          }
+          if (!result.completed) {
+            resultCode = "incomplete";
+            this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: result.stateCheck?.verdict ?? null,
+              observed_blocks: result.stateCheck?.observedBlocks ?? null, expected_blocks: result.stateCheck?.expectedBlocks ?? null });
+          } else {
             // The upstream model mismatch is observational, never a structural rejection:
             // acceptance follows the reference state rules alone. A mismatch is recorded on
             // the accept event so the dashboards can attribute the substitution.
             const mismatch = result.modelMismatch === true || (!!result.model && result.model !== model);
-            const outcome = this.publish(s, result.value, revision, "active", result.usage, mismatch);
+            const outcome = this.publish(s, result.value, revision, "active", result.usage, mismatch, safeModelName(result.model));
             // publish() already emitted the accept/discard/reject event for this outcome;
             // emitting again here is what duplicated every probe event in the overview.
             published = true;
@@ -331,16 +380,23 @@ export class TurnStateRuntime {
             resultCode = outcome.accepted
               ? (outcome.code === "accepted_model_mismatch" ? "accepted_model_mismatch" : result.model ? "accepted" : "model_unknown")
               : (result.stateCheck?.reason ?? outcome.reason ?? outcome.code);
+            // `model_unknown` is still an accepted observation, so it must not look like a failure.
+            if (resultCode === "model_unknown") this.outcome(s, resultCode, null);
           }
           if (accepted) { this.counts.accepted_probes++; break; }
           this.counts.rejected_probes++;
           if (!published) {
+            this.outcome(s, resultCode, { code: resultCode, reason: result.stateCheck?.reason ?? null,
+              verdict: result.stateCheck?.verdict ?? null, observed_blocks: result.stateCheck?.observedBlocks ?? null,
+              expected_blocks: result.stateCheck?.expectedBlocks ?? null });
             this.event(s, "active", "reject", resultCode, null, result.usage, result.stateCheck?.reason ?? null,
-              result.stateCheck?.observedBlocks ?? null, result.stateCheck?.expectedBlocks ?? null);
+              result.stateCheck?.observedBlocks ?? null, result.stateCheck?.expectedBlocks ?? null,
+              safeModelName(result.model), result.stateCheck?.verdict ?? null);
           }
         } catch {
           resultCode = controller.signal.aborted ? "cancelled" : "transport_error";
           if (reserved) this.counts.rejected_probes++;
+          this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: null, observed_blocks: null, expected_blocks: null });
           this.event(s, "active", "reject", resultCode);
         } finally { clearTimeout(timeout); }
       }
@@ -376,7 +432,7 @@ export class TurnStateRuntime {
       }
       this.promote(s);
       if (!s.stopped && !s.task && s.nextProbe <= this.now() && s.businessUntil + 3600_000 < this.now()) { this.sessions.delete(key); continue; }
-      if (this.config.active_enabled && !s.stopped && s.businessUntil > this.now() && s.nextProbe <= this.now()
+      if (this.config.active_enabled && !s.stopped && !isProbeExcluded(s.scope.model) && s.businessUntil > this.now() && s.nextProbe <= this.now()
         && (!this.usable(s.active) || s.active.expires - this.now() <= this.config.refresh_before_seconds * 1000)
         && !this.usable(s.ready)) void this.probe(s.scope.entryId, s.scope.model);
     }
@@ -401,6 +457,9 @@ export class TurnStateRuntime {
         phase: s.stopped ? "paused" : s.scope.unsupported ? "unsupported" : s.task ? "collecting" : blocked ? "blocked" : active?.usable ? "usable" : active ? "expired" : "empty",
         active, ready, injection_count: s.injectionCount, observation_count: s.observationCount, probe_count: s.probeCount,
         ws_connection_reused: s.reusedCount, strikes: s.failures, diagnostic: s.diagnostic,
+        excluded: isProbeExcluded(s.scope.model),
+        last_upstream_model: s.lastUpstreamModel, model_mismatch: s.modelMismatch,
+        last_result: s.lastResult, last_failure: s.lastFailure ? { ...s.lastFailure } : null,
         last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
     });
     return { schema: "codex-proxy.turn-state-overview.v1" as const, server_time: iso(this.now())!, epoch: this.epoch,

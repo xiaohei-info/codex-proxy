@@ -9,6 +9,16 @@ export function scopeIdentity(token: string, accountId: string | null, base: str
   return { credential, identity: digest(JSON.stringify([credential, base, proxy])) };
 }
 export const record = (v: unknown): Record<string, unknown> => typeof v === "object" && v !== null ? v as Record<string, unknown> : {};
+/**
+ * Upstream-disclosed model names are untrusted free text. Cap the length and strip
+ * control characters so a hostile or malformed name cannot produce a snapshot the
+ * Keeper whitelist decoder rejects (it requires <=256 chars and no CR/LF/NUL).
+ */
+export function safeModelName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(/[\r\n\0]/g, " ").trim();
+  return cleaned === "" ? null : Array.from(cleaned).slice(0, 128).join("");
+}
 const tokenCount = (v: unknown): number | null => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 export function stateMetadata(data: unknown): string | undefined {
   const headers = record(record(data).headers);

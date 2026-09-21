@@ -46,6 +46,16 @@ export type StateRule =
 
 export type StateCheckVerdict = "ok" | "shape_mismatch" | "no_state" | "invalid" | "expired";
 
+/**
+ * Models excluded from ACTIVE probing only. Excluding at the probe boundary (not
+ * in `resolve`) keeps business injection, passive collection, upstream-model
+ * observation and substitution stats working for these models.
+ */
+export const EXCLUDED_PROBE_MODELS = ["codex-auto-review"];
+
+/** Single spelling for the probe-boundary exclusion check. */
+export const isProbeExcluded = (model: string): boolean => EXCLUDED_PROBE_MODELS.includes(model);
+
 export interface StateCheckResult {
   verdict: StateCheckVerdict;
   /** First failing rule code; null when the verdict is ok or no_state. */

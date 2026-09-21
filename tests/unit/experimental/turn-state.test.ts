@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TurnStateRuntime, type ProbeTransport, type Scope } from "@src/experimental/turn-state/runtime.js";
-import { isCompactionTrigger, parseState } from "@src/experimental/turn-state/policy.js";
+import { EXCLUDED_PROBE_MODELS, isCompactionTrigger, parseState } from "@src/experimental/turn-state/policy.js";
 import { redactTurnStateJson } from "@src/experimental/turn-state/redact.js";
 import { parseSSEStream } from "@src/proxy/codex-sse.js";
 import { createTurnStateRoutes } from "@src/routes/admin/turn-state.js";
@@ -149,6 +149,80 @@ describe("turn-state runtime", () => {
     expect(await r.probe("entry", "model")).toBe("block_mismatch");
     expect(r.overview().summary.accepted_probes).toBe(0);
     expect(r.overview().summary.rejected_probes).toBe(2);
+  });
+  it("excludes codex-auto-review from active probing without touching business injection or passive capture", async () => {
+    // Probe-boundary exclusion only: resolve()/begin() must keep working, otherwise passive capture
+    // and injection would silently die for this model too.
+    const send = vi.fn(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(), model: "model" }; });
+    const { runtime: r } = setup(send);
+    const excluded = { ...scope, model: EXCLUDED_PROBE_MODELS[0] };
+    const attempt = r.begin(excluded, undefined)!;
+    expect(attempt).not.toBeNull();
+    attempt.observe(token()); attempt.complete();
+    expect(r.overview().summary.passive_observations).toBe(1);
+    expect(r.overview().sessions.find(s => s.model === excluded.model)?.active?.usable).toBe(true);
+    // No dispatch, no upstream request, no budget consumption.
+    expect(await r.probe("entry", excluded.model)).toBe("excluded");
+    expect(send).not.toHaveBeenCalled();
+    const session = r.overview().sessions.find(s => s.model === excluded.model)!;
+    expect(session).toMatchObject({ excluded: true, probe_count: 0, last_failure: null });
+    expect(r.overview().summary.active_probes).toBe(0);
+    // The budget is untouched, so a normal model still gets its full round.
+    expect(await r.probe("entry", "model")).toBe("accepted");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+  it("keeps tick from scheduling a background probe for an excluded model", async () => {
+    const send = vi.fn(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(), model: "model" }; });
+    const { runtime: r } = setup(send);
+    const probe = vi.spyOn(r, "probe");
+    const excluded = { ...scope, model: EXCLUDED_PROBE_MODELS[0] };
+    // A wire on a business attempt is what makes a session background-probe eligible.
+    const attempt = r.begin(excluded, undefined)!; attempt.wire("http"); attempt.complete();
+    r.tick();
+    // The scheduler must not even attempt it, so no budget slot can be burned either.
+    expect(probe).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    const session = r.overview().sessions.find(s => s.model === excluded.model)!;
+    expect(session).toMatchObject({ excluded: true, probe_count: 0 });
+    // A non-excluded model in the same state IS scheduled, proving tick is still live.
+    const normal = r.begin({ ...scope, model: "gpt-5.6-sol" }, undefined)!; normal.wire("http"); normal.complete();
+    r.tick();
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+  it("records the upstream model, mismatch flag and last failure per session for the status card", async () => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(NOW, 11), model: "gpt-5.6-luna" }; });
+    expect(await r.probe("entry", "model")).toBe("block_mismatch");
+    expect(r.overview().sessions[0]).toMatchObject({
+      last_upstream_model: "gpt-5.6-luna", model_mismatch: true, last_result: "block_mismatch",
+      last_failure: { code: "block_mismatch", reason: "block_mismatch", verdict: "shape_mismatch", observed_blocks: 11, expected_blocks: 10 },
+    });
+    // A later success on the same session clears the failure so the card cannot keep showing a stale reason.
+    publish(r, token(NOW + 1000, 10, 2));
+    expect(r.overview().sessions[0].last_failure).toBeNull();
+    expect(r.overview().sessions[0].last_result).toBe("accepted");
+  });
+  it("carries verdict and upstream model on the overview events", async () => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(NOW, 11), model: "other-model" }; });
+    expect(await r.probe("entry", "model")).toBe("block_mismatch");
+    const reject = r.overview().events.find(e => e.result === "block_mismatch")!;
+    expect(reject).toMatchObject({ verdict: "shape_mismatch", upstream_model: "other-model" });
+    // A passive observation with no upstream model attached reports null rather than a stale model.
+    publish(r, token(NOW + 1000, 10, 2));
+    expect(r.overview().events.find(e => e.action === "accept")!).toMatchObject({ verdict: "ok", upstream_model: null });
+  });
+  it("sanitizes a hostile upstream model name so the snapshot stays decodable", async () => {
+    // Keeper's whitelist decoder rejects a value over 256 chars or containing CR/LF/NUL;
+    // an unsanitized upstream name would make the WHOLE snapshot unavailable.
+    const hostile = "x\n".repeat(400) + "A".repeat(400);
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(NOW, 10), model: hostile }; });
+    await r.probe("entry", "model");
+    const overview = r.overview();
+    const disclosed = overview.sessions[0].last_upstream_model!;
+    expect(disclosed.length).toBeLessThanOrEqual(128);
+    expect(/[\r\n\0]/.test(disclosed)).toBe(false);
+    const serialized = JSON.stringify(overview);
+    expect(serialized).not.toContain("\\n");
+    expect(overview.events.some(e => e.upstream_model !== null)).toBe(true);
   });
   it("reports no_state when the upstream returned no state at all", async () => {
     const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, model: "model" }; });
