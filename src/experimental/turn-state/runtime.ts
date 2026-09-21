@@ -83,6 +83,11 @@ export interface Attempt {
   complete: () => void;
 }
 export type WireKind = "http" | "new" | "reuse";
+/**
+ * The credential/identity a dispatch will actually ship with, computed where the token, account
+ * and route live. A snapshot or ticket bound to anything else must be refused, not shipped.
+ */
+export interface DispatchIdentity { identity: string; credential: string }
 /** Ticket mode is a separate decision layer; the generic snapshot/service is never consulted for it. */
 interface TicketPlan {
   /** Config epoch this decision was taken under, so a stale dispatch cannot commit after an admin change. */
@@ -222,7 +227,65 @@ export class TurnStateRuntime {
     this.promote(s);
     return s;
   }
-  begin(scope: Scope, existing: string | undefined): Attempt | null {
+  /**
+   * The single decision entry for one business dispatch.
+   *
+   * The generic snapshot layer and the opt-in ticket layer are resolved and composed here, so the
+   * transport only ever sees one `Attempt` and never has to know which layer produced it, whether
+   * a second layer exists, or which of the two `wire` calls each layer is entitled to.
+   *
+   * `dispatch` is the credential/identity this request will actually ship with. Supplying it opts
+   * into the composed (production) path; omitting it exercises the generic layer alone, which is
+   * what synthetic/read-only callers and the unit tests want.
+   */
+  begin(scope: Scope, existing: string | undefined, dispatch?: DispatchIdentity): Attempt | null {
+    const generic = dispatch === undefined || scope.unsupported || scope.identity === dispatch.identity
+      ? this.genericAttempt(scope, existing) : null;
+    // The two-argument form is the generic layer's own contract, returned exactly as it always
+    // was: callers of it drive a single layer directly, with no ticket concept and no per-call
+    // dispatch guard (that guard lives in the transport, where it always lived).
+    if (dispatch === undefined) return generic;
+    // A production call gets a normalized attempt instead, so the transport never learns that a
+    // second layer exists nor which of the two wire calls each layer is entitled to.
+    const ticket = this.ticketAttempt(scope, existing, () => this.liveScope(scope, dispatch));
+    if (generic === null && ticket === null) return null;
+    return this.composeAttempts(generic, ticket);
+  }
+  /**
+   * The scope this request will actually dispatch with, or null when the credential, account or
+   * business route has moved on since selection. Re-resolved through the runtime's own resolver,
+   * so the caller never has to know why a bound snapshot stopped applying.
+   */
+  private liveScope(scope: Scope, dispatch: DispatchIdentity): Scope | null {
+    const live = this.resolve?.(scope.entryId, scope.model);
+    if (!live) return null;
+    return live.identity === dispatch.identity && live.credential === dispatch.credential ? live : null;
+  }
+  /**
+   * Compose whichever layers are active into the single attempt the transport sees.
+   *
+   * The transport reports each attempt twice: a pre-flight call (`dispatched` unset) before it
+   * commits, then the on-the-wire call (`dispatched: true`). The layers want different halves.
+   * The ticket layer needs the pre-flight call, because that is the last moment a stale binding
+   * can still be refused before anything is sent. Generic bookkeeping must only ever count a real
+   * dispatch. Normalizing both here is what keeps the transport layer-agnostic.
+   */
+  private composeAttempts(generic: Attempt | null, ticket: Attempt | null): Attempt {
+    return {
+      // The generic snapshot wins when it has one; a ticket is a stricter source for the same
+      // header, never a competing one. `strictMissing` likewise belongs to the generic knob.
+      value: generic?.value ?? ticket?.value,
+      strictMissing: generic?.strictMissing ?? false,
+      wire: (kind, dispatched) => {
+        // A refusal must be able to stop the dispatch, so ticket errors propagate unswallowed.
+        ticket?.wire(kind, dispatched);
+        try { if (dispatched) generic?.wire(kind, dispatched); } catch { /* diagnostics never break business output */ }
+      },
+      observe: value => generic?.observe(value),
+      complete: () => { generic?.complete(); ticket?.complete(); },
+    };
+  }
+  private genericAttempt(scope: Scope, existing: string | undefined): Attempt | null {
     if (!this.enabled()) return null;
     const s = this.session(scope);
     if (!s || s.stopped || s.scope.unsupported) return null;
@@ -275,7 +338,7 @@ export class TurnStateRuntime {
    * dispatch WITH, so a ticket bound to a rotated credential or a changed business route
    * is refused instead of shipped.
    */
-  ticketBegin(scope: Scope, existing: string | undefined, live: () => Scope | null): Attempt | null {
+  private ticketAttempt(scope: Scope, existing: string | undefined, live: () => Scope | null): Attempt | null {
     const config = this.config.ticket;
     // Ticket mode is a sub-switch of the experiment: the master switch gates it too, so a
     // disabled experiment can never harvest, inject or accept a manual round.

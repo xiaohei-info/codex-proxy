@@ -300,7 +300,8 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
   it("counts one ticket once across a WS attempt and its HTTP fallback", async () => {
     const ticket = envelope();
     await verify(ticket);
-    const attempt = runtime.ticketBegin(scope, undefined, () => scope)!;
+    // The composed attempt is what the transport sees; it never learns a ticket layer exists.
+    const attempt = runtime.begin(scope, undefined, { identity: scope.identity, credential: scope.credential })!;
     expect(attempt.value).toBe(ticket);
     // The transport's pre-dispatch call, then a new-WS attempt, then the HTTP fallback.
     attempt.wire("new");
@@ -308,13 +309,17 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
     attempt.wire("http", true);
     expect(runtime.overview().summary.ticket_injected).toBe(1);
     // The reused-kind wire is the skip path and must not be counted as an injection.
-    runtime.ticketBegin(scope, undefined, () => scope)!.wire("reuse");
+    runtime.begin(scope, undefined, { identity: scope.identity, credential: scope.credential })!.wire("reuse");
     expect(runtime.overview().summary.ticket_injected).toBe(1);
     expect(runtime.overview().summary.ticket_reused_skipped).toBe(1);
   });
   it("skips a non-personal plan, since 292 is a personal envelope", async () => {
     await verify();
-    expect(runtime.ticketBegin({ ...scope, plan: "team" }, undefined, () => scope)).toBeNull();
+    const attempt = runtime.begin({ ...scope, plan: "team" }, undefined, { identity: scope.identity, credential: scope.credential });
+    // The generic layer may still apply, but no ticket is ever injected for a non-personal plan.
+    expect(attempt?.value).toBeUndefined();
+    attempt?.wire("new", true);
+    expect(runtime.overview().summary.ticket_injected).toBe(0);
   });
   it("never injects a candidate the business route has not confirmed", async () => {
     // A harvested target candidate with no revalidation transport: stored, but not verified.

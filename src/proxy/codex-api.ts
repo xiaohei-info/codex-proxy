@@ -9,7 +9,7 @@
  * (native rustls transport).
  */
 
-import { turnStateRuntime, type Attempt, type Scope } from "../experimental/turn-state/runtime.js";
+import { turnStateRuntime, type Attempt, type DispatchIdentity } from "../experimental/turn-state/runtime.js";
 import { isCompactionTrigger } from "../experimental/turn-state/policy.js";
 import { scopeIdentity, trustedBaseUrl, stateMetadata } from "../experimental/turn-state/protocol.js";
 import { getProxyUrl } from "../tls/proxy.js";
@@ -285,46 +285,30 @@ export class CodexApi {
     const scope = this.experimentalTurnState && this.entryId && trustedBaseUrl(base) && !isCompactionTrigger(request.input)
       ? turnStateRuntime.resolveScope(this.entryId, request.model) : null;
     const route = this.proxyUrl === undefined ? getProxyUrl() : this.proxyUrl;
-    // The scope resolved at request entry is only used for the generic attempt. Ticket mode
-    // re-resolves the identity the request will actually ship with (credential rotation, base
-    // URL edit, business route change) and binds the ticket to that one.
-    const attempt = scope && (scope.unsupported || scope.identity === scopeIdentity(this.token, this.accountId, base, route).identity)
-      ? turnStateRuntime.begin(scope, request.turnState) : null;
-    const revalidated = (): Scope | null => {
-      const live = scope ? turnStateRuntime.resolveScope(scope.entryId, scope.model) : null;
-      // The credential/route this request will actually ship with must still be the live one,
-      // otherwise the ticket's binding no longer describes this dispatch.
-      if (!live) return null;
-      const dispatched = scopeIdentity(this.token, this.accountId, base, route);
-      return live.identity === dispatched.identity && live.credential === dispatched.credential ? live : null;
-    };
-    const ticket = scope && !scope.unsupported
-      ? turnStateRuntime.ticketBegin(scope, request.turnState, revalidated) : null;
-    // The generic snapshot keeps precedence when it has one; a ticket is a stricter source for
-    // the same header, never a competing one.
-    const injected = attempt?.value ?? ticket?.value;
-    if (injected) request = { ...request, turnState: injected };
+    // One decision, one attempt: the runtime composes its generic snapshot layer and the opt-in
+    // ticket layer internally, so this transport never has to know which one produced the value
+    // or that two exist. The identity the request ships with is passed down so a snapshot bound
+    // to a rotated credential or a changed business route is refused rather than sent.
+    const dispatch: DispatchIdentity = scopeIdentity(this.token, this.accountId, base, route);
+    const attempt = scope ? turnStateRuntime.begin(scope, request.turnState, dispatch) : null;
+    if (attempt?.value) request = { ...request, turnState: attempt.value };
     let reused = false;
     const wire = (kind: "http" | "new" | "reuse", dispatched?: boolean) => {
       reused = kind === "reuse";
       if (attempt?.strictMissing && !reused) throw new CodexApiError(400, "experimental_turn_state_missing");
-      // Ticket revalidation must be able to interrupt a dispatch, so its errors are not swallowed.
-      // It is called before the attempt as well, which is the only point at which a stale binding
-      // can still be refused without having sent anything.
-      ticket?.wire(kind, dispatched);
-      try { if (dispatched) attempt?.wire(kind, dispatched); } catch { /* diagnostics cannot interrupt business dispatch */ }
+      // The attempt owns its own policy: it forwards the pre-flight call to whichever layer needs
+      // it, guards its own bookkeeping, and propagates a refusal. No layer knowledge here.
+      attempt?.wire(kind, dispatched);
     };
     const response = await this.dispatchResponse(request, signal, onRateLimits, poolCtx, wire);
     // A pooled reuse replays the original handshake headers onto this response, so its
     // x-codex-turn-state belongs to an earlier turn. Mark it for every consumer, not only
     // when the experiment is enabled, so observability never reads a stale transport header.
     if (reused) markTransportReused(response);
-    if (attempt || ticket) {
+    if (attempt) {
       // A reused socket's upgrade header belongs to an earlier response. Body metadata remains authoritative.
-      if (!reused) attempt?.observe(response.headers.get("x-codex-turn-state") ?? undefined);
-      const complete = () => { if (signal?.aborted) return; attempt?.complete(); ticket?.complete(); };
-      if (attempt) this.attempts.set(response, { ...attempt, complete });
-      else ticket!.complete = complete;
+      if (!reused) attempt.observe(response.headers.get("x-codex-turn-state") ?? undefined);
+      this.attempts.set(response, { ...attempt, complete: () => { if (!signal?.aborted) attempt.complete(); } });
     }
     return response;
   }

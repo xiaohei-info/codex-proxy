@@ -71,7 +71,7 @@ describe("J. the master switch gates ticket mode (P1-1)", () => {
       expect(ticketStore.usable(scope.entryId, scope.model, `${scope.identity}|${scope.credential}|${scope.routeId}`, Date.now())).not.toBeNull();
       // Same stored ticket, but the master switch is now off: it must not reach the wire.
       r.update({ enabled: false, mode: "off", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
-      expect(r.ticketBegin(scope, undefined, () => scope)).toBeNull();
+      expect(r.begin(scope, undefined, { identity: scope.identity, credential: scope.credential })).toBeNull();
     } finally { r.shutdown(); }
   });
 
