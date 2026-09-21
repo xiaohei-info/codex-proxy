@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { TurnStateConfigSchema, parseState, type ParsedState, type Plan, type TurnStateConfig } from "./policy.js";
+import { TurnStateConfigSchema, classifyState, parseState, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
 
 export interface Scope {
   entryId: string;
@@ -14,7 +14,19 @@ export interface Scope {
   provenance: "account" | "override" | "assumed_personal";
 }
 export interface ProbeUsage { input_tokens: number | null; output_tokens: number | null; reasoning_tokens: number | null }
-export interface ProbeResult { value?: string; completed: boolean; model?: string; modelMismatch?: boolean; status?: number; retryAfter?: number; usage?: ProbeUsage }
+/**
+ * Structural verdict for the probe's turn-state, produced by the single shared
+ * `classifyState`. `reason` is the first failing rule so a rejection stays
+ * explainable, and observed/expected blocks let the UI explain block_mismatch.
+ * Never carries the raw state value.
+ */
+export interface ProbeStateCheck {
+  verdict: StateCheckVerdict;
+  reason: StateRule | null;
+  observedBlocks: number | null;
+  expectedBlocks: number;
+}
+export interface ProbeResult { value?: string; completed: boolean; model?: string; modelMismatch?: boolean; status?: number; retryAfter?: number; usage?: ProbeUsage; stateCheck?: ProbeStateCheck }
 export type ProbeTransport = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
 interface State extends ParsedState { version: number }
 interface Session {
@@ -29,6 +41,11 @@ interface Event {
   id: string; at: string; entry_id: string | null; model: string | null;
   source: "passive" | "active" | "injection" | "lifecycle";
   action: string; result: string; length: number | null; blocks: number | null;
+  /** First failing rule that explains a rejection, or null when none applies. */
+  reason: string | null;
+  /** Envelope shape of the candidate: enough for the UI to explain block_mismatch. */
+  observed_blocks: number | null;
+  expected_blocks: number | null;
   route_id: string | null; usage: ProbeUsage | null;
 }
 export interface Attempt {
@@ -163,28 +180,49 @@ export class TurnStateRuntime {
       },
     };
   }
-  private publish(s: Session, candidate: unknown, revision: number, source: "passive" | "active", usage?: ProbeUsage): boolean {
-    const state = parseState(candidate, s.scope.plan, this.config.ttl_seconds, this.now());
-    if (revision < s.revision) { this.event(s, source, "discard", "stale_observation", state, usage); return false; }
+  /**
+   * Publish an observation. Returns the outcome and, on rejection, the first failing rule so the
+   * caller can report the same reason the audit event carries.
+   */
+  private publish(s: Session, candidate: unknown, revision: number, source: "passive" | "active", usage?: ProbeUsage, modelMismatch?: boolean): { accepted: boolean; code: string; reason: string | null; observedBlocks: number | null; expectedBlocks: number } {
+    const classified = classifyState(candidate, s.scope.plan, this.config.ttl_seconds, this.now());
+    const state = classified.state;
+    const blocks = { observedBlocks: classified.observedBlocks, expectedBlocks: classified.expectedBlocks };
+    if (revision < s.revision) {
+      this.event(s, source, "discard", "stale_observation", null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks);
+      return { accepted: false, code: "stale_observation", reason: classified.reason, ...blocks };
+    }
     s.revision = revision;
     if (!state) {
-      // Invalid candidates never revoke an accepted active snapshot or replay business output.
-      s.diagnostic = "invalid_candidate";
-      this.event(s, source, "reject", "invalid_candidate", null, usage);
-      return false;
+      // An invalid candidate never revokes an accepted active snapshot or replays business
+      // output. Report the first failing rule instead of a generic code so the reason is
+      // auditable; `no_state` has no failing rule, so its verdict is the code.
+      const reason = classified.reason ?? classified.verdict;
+      s.diagnostic = reason;
+      this.event(s, source, "reject", reason, null, usage, classified.reason, classified.observedBlocks, classified.expectedBlocks);
+      return { accepted: false, code: reason, reason: classified.reason, ...blocks };
     }
-    if (s.active && state.issued < s.active.issued) return false;
+    if (s.active && state.issued < s.active.issued) {
+      return { accepted: false, code: "stale_observation", reason: null, ...blocks };
+    }
     const accepted = { ...state, version: revision };
     if (!this.usable(s.active)) s.active = accepted;
     else if (state.fingerprint !== s.active.fingerprint) s.ready = accepted;
     this.promote(s);
     s.diagnostic = null;
-    this.event(s, source, "accept", "accepted", accepted, usage);
-    return true;
+    // A model mismatch is observational: the envelope passed every structural rule, so it is
+    // accepted, and the event still records that the upstream served a different model.
+    const code = modelMismatch ? "accepted_model_mismatch" : "accepted";
+    this.event(s, source, "accept", code, accepted, usage, null, state.blocks, classified.expectedBlocks);
+    return { accepted: true, code, reason: null, observedBlocks: state.blocks, expectedBlocks: classified.expectedBlocks };
   }
-  private event(s: Session, source: Event["source"], action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage): void {
+  private event(s: Session, source: Event["source"], action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage, reason?: string | null, observedBlocks?: number | null, expectedBlocks?: number | null): void {
     this.events.push({ id: randomUUID(), at: iso(this.now())!, entry_id: s.scope.entryId, model: s.scope.model,
-      source, action, result, length: state?.length ?? null, blocks: state?.blocks ?? null, route_id: s.scope.routeId, usage: usage ?? null });
+      source, action, result, length: state?.length ?? null, blocks: state?.blocks ?? null,
+      reason: reason ?? null,
+      observed_blocks: observedBlocks ?? state?.blocks ?? null,
+      expected_blocks: expectedBlocks ?? null,
+      route_id: s.scope.routeId, usage: usage ?? null });
     if (this.events.length > 200) this.events.shift();
   }
   private budgetTimes(entryId: string): number[] {
@@ -251,6 +289,7 @@ export class TurnStateRuntime {
         const timeout = setTimeout(() => controller.abort(), config.probe_timeout_seconds * 1000);
         let reserved = false;
         let dispatchOrder = 0;
+        let published = false;
         try {
           const result = await this.transport!(scope, controller.signal, () => {
             if (reserved || controller.signal.aborted || generation !== this.generation || scopeGeneration !== s.generation || !this.current(s)) return false;
@@ -278,15 +317,27 @@ export class TurnStateRuntime {
             break;
           }
           if (controller.signal.aborted || generation !== this.generation || scopeGeneration !== s.generation || !this.current(s)) { resultCode = "cancelled"; break; }
-          if (result.modelMismatch || (result.model && result.model !== model)) resultCode = "model_mismatch";
-          else if (!result.completed) resultCode = "incomplete";
+          if (!result.completed) resultCode = "incomplete";
           else {
-            accepted = this.publish(s, result.value, revision, "active", result.usage);
-            resultCode = accepted ? (result.model ? "accepted" : "model_unknown") : "invalid_candidate";
+            // The upstream model mismatch is observational, never a structural rejection:
+            // acceptance follows the reference state rules alone. A mismatch is recorded on
+            // the accept event so the dashboards can attribute the substitution.
+            const mismatch = result.modelMismatch === true || (!!result.model && result.model !== model);
+            const outcome = this.publish(s, result.value, revision, "active", result.usage, mismatch);
+            // publish() already emitted the accept/discard/reject event for this outcome;
+            // emitting again here is what duplicated every probe event in the overview.
+            published = true;
+            accepted = outcome.accepted;
+            resultCode = outcome.accepted
+              ? (outcome.code === "accepted_model_mismatch" ? "accepted_model_mismatch" : result.model ? "accepted" : "model_unknown")
+              : (result.stateCheck?.reason ?? outcome.reason ?? outcome.code);
           }
           if (accepted) { this.counts.accepted_probes++; break; }
           this.counts.rejected_probes++;
-          this.event(s, "active", "reject", resultCode, null, result.usage);
+          if (!published) {
+            this.event(s, "active", "reject", resultCode, null, result.usage, result.stateCheck?.reason ?? null,
+              result.stateCheck?.observedBlocks ?? null, result.stateCheck?.expectedBlocks ?? null);
+          }
         } catch {
           resultCode = controller.signal.aborted ? "cancelled" : "transport_error";
           if (reserved) this.counts.rejected_probes++;

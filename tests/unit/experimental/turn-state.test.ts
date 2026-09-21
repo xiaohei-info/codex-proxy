@@ -106,13 +106,66 @@ describe("turn-state runtime", () => {
     if (code === "quota_blocked") { expect(await r.probe("entry", "third")).toBe(code); advance(901_000); }
     await r.probe("entry", "third"); expect(send).toHaveBeenCalledTimes(2);
   });
-  it.each([{ completed: false }, { completed: true, model: "wrong" }, { completed: true, model: "model", modelMismatch: true }])("rejects failed or mismatched probe %j", async result => {
-    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { ...result, value: token() }; });
+  it.each([
+    { name: "incomplete", value: undefined, completed: false },
+  ])("rejects a $name probe", async ({ value, completed }) => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed, value }; });
     await r.probe("entry", "model");
     expect(r.overview().summary.usable).toBe(0);
     expect(r.overview().summary.active_probes).toBe(2);
     expect(r.overview().summary.rejected_probes).toBe(2);
     expect(await r.probe("entry", "model")).toBe("cooldown");
+  });
+  it("accepts a valid state served by a different upstream model and records the mismatch", async () => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(), model: "other-model" }; });
+    // A model mismatch is observational: the envelope passes every structural rule, so it is used.
+    expect(await r.probe("entry", "model")).toBe("accepted_model_mismatch");
+    expect(r.overview().summary.usable).toBe(1);
+    expect(r.overview().summary.accepted_probes).toBe(1);
+    expect(r.overview().summary.rejected_probes).toBe(0);
+    const accept = r.overview().events.find(e => e.result === "accepted_model_mismatch")!;
+    expect(accept.model).toBe("model");
+    expect(accept.blocks).toBe(10);
+    expect(accept.expected_blocks).toBe(10);
+  });
+  it.each([
+    { name: "block_mismatch", blocks: 11, reason: "block_mismatch" },
+    { name: "expired", blocks: 10, reason: "expired", issued: NOW - 3570_000 },
+  ])("reports the first failing rule for a $name state instead of invalid_candidate", async ({ blocks, reason, issued }) => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, model: "model", value: token(issued ?? NOW, blocks) }; });
+    expect(await r.probe("entry", "model")).toBe(reason);
+    expect(r.overview().summary.usable).toBe(0);
+    const reject = r.overview().events.find(e => e.result === reason)!;
+    expect(reject.reason).toBe(reason);
+    if (reason === "block_mismatch") {
+      expect(reject.observed_blocks).toBe(11);
+      expect(reject.expected_blocks).toBe(10);
+      expect(reject.blocks).toBeNull();
+    }
+  });
+  it("accepts a mismatching model when the envelope itself is valid", async () => {
+    // A 11-block personal envelope is rejected on shape, regardless of the model that served it.
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, model: "other-model", value: token(NOW, 11) }; });
+    expect(await r.probe("entry", "model")).toBe("block_mismatch");
+    expect(r.overview().summary.accepted_probes).toBe(0);
+    expect(r.overview().summary.rejected_probes).toBe(2);
+  });
+  it("reports no_state when the upstream returned no state at all", async () => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, model: "model" }; });
+    expect(await r.probe("entry", "model")).toBe("no_state");
+    expect(r.overview().events.find(e => e.result === "no_state")!.reason).toBeNull();
+  });
+  it("emits exactly one reject event per probe attempt, carrying the failed rule and shape", async () => {
+    // Regression: publish() already records the reject outcome, so the probe loop must not write
+    // a second event for the same attempt — duplicates made the overview unreadable.
+    let now = NOW;
+    const r = new TurnStateRuntime(() => now); runtimes.push(r);
+    r.update({ enabled: true, mode: "always", active_enabled: true, max_attempts_per_round: 1 });
+    r.start((entryId, model) => ({ ...scope, entryId, model }), async (_s, _a, reserve) => ({ completed: reserve(), value: token(NOW, 11), model: "model" }));
+    expect(await r.probe("entry", "model")).toBe("block_mismatch");
+    const rejects = r.overview().events.filter(e => e.action === "reject");
+    expect(rejects).toHaveLength(1);
+    expect(rejects[0]).toMatchObject({ result: "block_mismatch", reason: "block_mismatch", observed_blocks: 11, expected_blocks: 10 });
   });
   it("pauses the entire scope until explicit resume, preserving unrelated publications and guards", async () => {
     const { runtime: r } = setup();

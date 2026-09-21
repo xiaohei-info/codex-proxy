@@ -8,7 +8,7 @@ import { getProxyUrl } from "../../tls/proxy.js";
 import { hasReachedCachedQuota } from "../../auth/quota-skip.js";
 import { parseRateLimitHeaders, rateLimitToQuota } from "../../proxy/rate-limit-headers.js";
 import { trustedBaseUrl, scopeIdentity, stateMetadata, probeUsage, record, retryAfterSeconds } from "./protocol.js";
-import { digest } from "./policy.js";
+import { digest, classifyState } from "./policy.js";
 import { planForAccountMode } from "./policy.js";
 import { turnStateRuntime, type Scope, type ProbeResult } from "./runtime.js";
 
@@ -71,6 +71,16 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
         }
       }
       if (result.status === 429 || result.status === 402) accountPool.applyRateLimit429(scope.entryId, { retryAfterSec: retryAfter, countRequest: false });
+      // Classify with the single shared rule set so the probe reports the same first failing
+      // rule the passive path does. Model mismatch stays a separate observational field and
+      // never changes the structural verdict.
+      const classified = classifyState(result.value, scope.plan, turnStateRuntime.config.ttl_seconds, Date.now());
+      result.stateCheck = {
+        verdict: classified.verdict,
+        reason: classified.reason,
+        observedBlocks: classified.observedBlocks,
+        expectedBlocks: classified.expectedBlocks,
+      };
       return result;
     } catch (error) {
       if (error instanceof CodexApiError) {

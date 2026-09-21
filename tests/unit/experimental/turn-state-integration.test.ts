@@ -43,9 +43,14 @@ describe("active probe HTTP/account integration", () => {
     expect(event.usage).toEqual({ input_tokens: 2, output_tokens: 1, reasoning_tokens: null });
     expect(JSON.stringify(runtime.overview())).not.toContain(entry.token);
   });
-  it("cannot overwrite an earlier authoritative model mismatch with a matching completion", async () => {
+  it("keeps the first authoritative mismatch on record but still accepts a structurally valid state", async () => {
+    // The upstream's first model claim wins as the observability signal; a later completion
+    // carrying the requested name must not erase it. Model mismatch is observational, so the
+    // valid envelope is still accepted rather than discarded.
     fake.post.mockImplementation(async () => response([{ type: "response.created", response: { model: "wrong" } }, { type: "response.completed", response: { status: "completed", model: "actual" } }]));
-    expect(await runtime.probe(entry.id, "actual")).toBe("model_mismatch"); expect(runtime.overview().summary.usable).toBe(0);
+    expect(await runtime.probe(entry.id, "actual")).toBe("accepted_model_mismatch");
+    expect(runtime.overview().summary.usable).toBe(1);
+    expect(runtime.overview().events.some(e => e.result === "accepted_model_mismatch")).toBe(true);
   });
   it("HTTP200 incomplete is not accepted", async () => {
     fake.post.mockImplementation(async () => response([{ type: "response.created", response: { model: "actual" } }]));
