@@ -4,6 +4,21 @@ import type { ProbeUsage } from "./runtime.js";
 export function trustedBaseUrl(base: string): boolean {
   return base === "https://chatgpt.com/backend-api";
 }
+/**
+ * Mask a proxy URL's password for every admin/public projection, mirroring
+ * `ProxyPool.getAllMasked`. The ticket config otherwise round-trips through the UI and
+ * a logged response body, neither of which may carry the harvest credential.
+ */
+export function maskProxyUrl(url: string | null): string | null {
+  if (url === null) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.password) parsed.password = "***";
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
 export function scopeIdentity(token: string, accountId: string | null, base: string, proxy: string | null): { credential: string; identity: string } {
   const credential = digest(JSON.stringify([token, accountId]));
   return { credential, identity: digest(JSON.stringify([credential, base, proxy])) };

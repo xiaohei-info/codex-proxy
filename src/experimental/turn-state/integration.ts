@@ -29,7 +29,14 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
       plan, provenance };
   };
   turnStateRuntime.update(getConfig().experimental_turn_state ?? {});
-  turnStateRuntime.start(resolve, async (scope, signal, reserve): Promise<ProbeResult> => {
+  /**
+   * One leasing + dispatch round. `egressRoute` selects the network path: the account's own
+   * business route for probing and for ticket revalidation, or the dedicated
+   * `harvest_proxy_url` for a synthetic harvest. `turnState` is the candidate a revalidation
+   * pass must carry; generic probing and harvest never send one.
+   */
+  const round = async (scope: Scope, signal: AbortSignal, reserve: () => boolean, egressRoute: string | null | undefined,
+    attributeQuota: boolean, turnState?: string): Promise<ProbeResult> => {
     const entry = accountPool.getEntry(scope.entryId);
     if (!entry || hasReachedCachedQuota(entry, scope.model)) return { completed: false };
     const acquired = accountPool.acquire({ model: scope.model, preferredEntryId: scope.entryId,
@@ -42,12 +49,14 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
       if (wait > 0) await new Promise<void>(r => { const t = setTimeout(r, wait); signal.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true }); });
       if (signal.aborted || resolve(scope.entryId, scope.model)?.identity !== scope.identity) return { completed: false };
       const api = new CodexApi(acquired.token, acquired.accountId, cookieJar, scope.entryId,
-        proxyPool.resolveProxyUrl(scope.entryId), undefined, undefined, { codexFingerprintMode: acquired.codexFingerprintMode });
+        egressRoute, undefined, undefined, { codexFingerprintMode: acquired.codexFingerprintMode });
       // The reservation is at the actual HTTP transport seam, not before fingerprint/serialization work.
       const response = await api.createProbeResponse({ model: scope.model, instructions: "Reply with OK only.",
-        input: [{ role: "user", content: "OK" }], stream: true, store: false }, signal, reserve);
+        input: [{ role: "user", content: "OK" }], stream: true, store: false, ...(turnState === undefined ? {} : { turnState }) }, signal, reserve);
       const limits = parseRateLimitHeaders(response.headers);
-      if (limits) accountPool.updateCachedQuota(scope.entryId, rateLimitToQuota(limits, entry.planType));
+      // Quota is account-level business state: a harvest over the dedicated proxy must not
+      // attribute that egress's limits to the account's business route.
+      if (limits && attributeQuota) accountPool.updateCachedQuota(scope.entryId, rateLimitToQuota(limits, entry.planType));
       const retryAfter = retryAfterSeconds(response.headers.get("retry-after"), turnStateRuntime.config.cooldown_seconds);
       const result: ProbeResult = { retryAfter, value: response.headers.get("x-codex-turn-state") ?? undefined, completed: false };
       for await (const event of api.parseStream(response)) {
@@ -70,7 +79,7 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
           break;
         }
       }
-      if (result.status === 429 || result.status === 402) accountPool.applyRateLimit429(scope.entryId, { retryAfterSec: retryAfter, countRequest: false });
+      if (attributeQuota && (result.status === 429 || result.status === 402)) accountPool.applyRateLimit429(scope.entryId, { retryAfterSec: retryAfter, countRequest: false });
       // Classify with the single shared rule set so the probe reports the same first failing
       // rule the passive path does. Model mismatch stays a separate observational field and
       // never changes the structural verdict.
@@ -85,12 +94,24 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
     } catch (error) {
       if (error instanceof CodexApiError) {
         const retryAfter = retryAfterSeconds(error.headers?.get("retry-after"), turnStateRuntime.config.cooldown_seconds);
-        if (error.status === 429 || error.status === 402) accountPool.applyRateLimit429(scope.entryId, { retryAfterSec: retryAfter, countRequest: false });
+        if (attributeQuota && (error.status === 429 || error.status === 402)) accountPool.applyRateLimit429(scope.entryId, { retryAfterSec: retryAfter, countRequest: false });
         return { completed: false, status: error.status, retryAfter };
       }
       throw error;
     } finally {
       accountPool.releaseWithoutCounting(acquired.entryId);
     }
-  });
+  };
+  turnStateRuntime.start(resolve, (scope, signal, reserve) =>
+    round(scope, signal, reserve, proxyPool.resolveProxyUrl(scope.entryId), true));
+  turnStateRuntime.startTicket(
+    // A harvest only ever leaves through the dedicated proxy, and only when the operator set one.
+    (scope, signal, reserve) => {
+      const harvest = getConfig().experimental_turn_state?.ticket.harvest_proxy_url;
+      return harvest === null || harvest === undefined
+        ? Promise.resolve({ completed: false })
+        : round(scope, signal, reserve, harvest, false);
+    },
+    // Revalidation must reproduce the real business dispatch: same account, same model, same route.
+    (scope, value, signal, reserve) => round(scope, signal, reserve, proxyPool.resolveProxyUrl(scope.entryId), true, value));
 }

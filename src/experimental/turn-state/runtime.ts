@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { TurnStateConfigSchema, classifyState, isProbeExcluded, parseState, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
-import { safeModelName } from "./protocol.js";
+import { CodexApiError } from "../../proxy/codex-types.js";
+import { TurnStateConfigSchema, classifyState, isProbeExcluded, parseState, stateApplies, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
+import { ticketBinding, ticketStore, targetCandidate, type TicketObservation } from "./ticket-store.js";
+import { safeModelName, maskProxyUrl } from "./protocol.js";
 
 export interface Scope {
   entryId: string;
@@ -53,9 +55,10 @@ interface Session {
   task?: Promise<string>; abort?: AbortController;
 }
 interface Guard { identity: string; blocked: boolean; authOrder: number; until: number }
+export type EventSource = "passive" | "active" | "injection" | "lifecycle" | "ticket";
 interface Event {
   id: string; at: string; entry_id: string | null; model: string | null;
-  source: "passive" | "active" | "injection" | "lifecycle";
+  source: EventSource;
   action: string; result: string; length: number | null; blocks: number | null;
   /** First failing rule that explains a rejection, or null when none applies. */
   reason: string | null;
@@ -71,10 +74,28 @@ interface Event {
 export interface Attempt {
   value?: string;
   strictMissing: boolean;
-  wire: (kind: "http" | "new" | "reuse") => void;
+  /**
+   * Called just before a transport attempt and again once it is on the wire, so a decision
+   * layer can revalidate at dispatch time and count the outcome exactly once.
+   */
+  wire: (kind: WireKind, dispatched?: boolean) => void;
   observe: (value: unknown) => void;
   complete: () => void;
 }
+export type WireKind = "http" | "new" | "reuse";
+/** Ticket mode is a separate decision layer; the generic snapshot/service is never consulted for it. */
+interface TicketPlan {
+  /** Config epoch this decision was taken under, so a stale dispatch cannot commit after an admin change. */
+  configEpoch: number;
+  /** Whether a ticket was actually confirmed for this dispatch, so `complete` cannot count twice. */
+  confirmed: boolean;
+}
+/** One ticket-mode egress attempt: the dedicated harvest proxy or the business route. */
+type TicketSend = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
+/** The one spelling between a transport kind and the auditable ticket event result. */
+const WIRE_RESULTS: Record<WireKind, string> = { http: "http", new: "ws_new", reuse: "ws_connection_reused" };
+/** The ticket-layer counters, one per dispatch decision the operator can observe. */
+type TicketCounter = "ticket_injected" | "ticket_unverified" | "ticket_revalidation_failed" | "ticket_reused_skipped" | "ticket_revalidation_attempts";
 const iso = (n: number | null): string | null => n === null ? null : new Date(n).toISOString();
 const keyOf = (s: Pick<Scope, "entryId" | "model">): string => JSON.stringify([s.entryId, s.model]);
 
@@ -93,6 +114,17 @@ export class TurnStateRuntime {
   private timer?: ReturnType<typeof setInterval>;
   private transport?: ProbeTransport;
   private resolve?: (entryId: string, model: string) => Scope | null;
+  /** Bumped on every config change that invalidates in-flight work, like `generation` but tick-visible. */
+  private configEpoch = 0;
+  private ticketEvents: Event[] = [];
+  private ticketCounts = { ticket_injected: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
+  /** The two ticket-mode egresses: the dedicated harvest proxy, and the account's business route. */
+  private harvestTransport?: (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
+  private revalidateTransport?: (scope: Scope, value: string, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
+  /** Per-scope singleflight, bounded global concurrency and abort handles for ticket rounds. */
+  private ticketRounds = new Map<string, Promise<string>>();
+  private ticketControllers = new Map<string, AbortController>();
+  private ticketRunning = 0;
   private counts = { injection_count: 0, passive_observations: 0, passive_accepted: 0, passive_rejected: 0, active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0 };
   constructor(private now: () => number = Date.now) {}
 
@@ -102,9 +134,20 @@ export class TurnStateRuntime {
     this.timer ??= setInterval(() => this.tick(), 15_000);
     this.timer.unref?.();
   }
+  /**
+   * Bind the ticket-mode egresses. `harvest` is the dedicated synthetic proxy; `revalidate`
+   * re-runs a candidate through the account's own business route. Both are separate from the
+   * generic `ProbeTransport`, so ticket mode never reads or writes the generic snapshot.
+   */
+  startTicket(harvest: (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>,
+    revalidate?: (scope: Scope, value: string, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>): void {
+    this.harvestTransport = harvest;
+    this.revalidateTransport = revalidate;
+  }
   update(config: unknown): void {
     const parsed = TurnStateConfigSchema.parse(config);
     if (JSON.stringify(parsed) === JSON.stringify(this.config)) return;
+    this.configEpoch++;
     this.invalidate();
     for (const s of this.sessions.values()) { s.active = null; s.ready = null; s.businessUntil = 0; }
     this.config = parsed;
@@ -116,17 +159,32 @@ export class TurnStateRuntime {
   private invalidate(): void {
     this.generation++;
     for (const session of this.sessions.values()) session.abort?.abort();
+    for (const controller of this.ticketControllers.values()) controller.abort();
   }
   shutdown(): void {
     this.invalidate();
     clearInterval(this.timer);
     this.timer = undefined;
     this.sessions.clear();
+    // Tickets themselves persist (that is their point); only the process-scoped counters reset.
+    this.ticketCounts = { ticket_injected: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
+    this.ticketEvents = [];
+    this.ticketRounds.clear();
+    this.ticketControllers.clear();
+    this.ticketRunning = 0;
     this.transport = undefined;
     this.resolve = undefined;
+    this.harvestTransport = undefined;
+    this.revalidateTransport = undefined;
   }
   resolveScope(entryId: string, model: string): Scope | null { return this.resolve?.(entryId, model) ?? null; }
   private enabled(): boolean { return this.config.enabled && this.config.mode !== "off"; }
+  /**
+   * Whether a raw turn state may appear in streamed bytes, so raw debug chunks cannot be
+   * safely redacted by stateless regex. Ticket mode harvests a raw state whether or not the
+   * generic layer is on, so it has to be included or a ticket would land in the dump.
+   */
+  redactsStreams(): boolean { return this.enabled() || this.config.ticket.enabled; }
   private current(s: Session): boolean {
     if (this.sessions.get(keyOf(s.scope)) !== s) return false;
     const scope = this.resolve?.(s.scope.entryId, s.scope.model);
@@ -172,7 +230,7 @@ export class TurnStateRuntime {
     const generation = this.generation;
     const scopeGeneration = s.generation;
     const c = this.config;
-    const applies = c.mode === "always" || (c.mode === "replace" && !!existing && !parseState(existing, scope.plan, c.ttl_seconds, this.now()));
+    const applies = stateApplies(c.mode, existing, scope.plan, c.ttl_seconds, this.now());
     const value = applies && this.usable(s.active) ? s.active.value : undefined;
     let candidate: unknown;
     let completed = false;
@@ -207,6 +265,203 @@ export class TurnStateRuntime {
         else this.counts.passive_rejected++;
       },
     };
+  }
+  /**
+   * Ticket-mode decision for one business dispatch. Returns null when ticket mode does
+   * not cover this dispatch (disabled, non-personal plan, unsupported route, stopped
+   * scope), so the generic attempt alone governs it and generic behavior is unchanged.
+   *
+   * `live` must resolve the credential/account/route identity this request will actually
+   * dispatch WITH, so a ticket bound to a rotated credential or a changed business route
+   * is refused instead of shipped.
+   */
+  ticketBegin(scope: Scope, existing: string | undefined, live: () => Scope | null): Attempt | null {
+    const config = this.config.ticket;
+    if (!config.enabled || scope.plan !== "personal" || scope.unsupported) return null;
+    const s = this.session(scope);
+    if (!s || s.stopped) return null;
+    const epoch = this.configEpoch;
+    const now = this.now();
+    const entry = live();
+    const bound = entry ? ticketBinding(entry) : "";
+    const ticket = entry ? ticketStore.usable(scope.entryId, scope.model, bound, now) : null;
+    // A dispatch whose identity no longer resolves is a revalidation failure, not a missing
+    // ticket: the stored ticket was verified for a route this request cannot use.
+    const blocked = entry ? (ticket ? null : ticketStore.blockedReason(scope.entryId, scope.model, bound, now)) : "ticket_revalidation_failed";
+    const plan: TicketPlan = { configEpoch: epoch, confirmed: false };
+    /**
+     * The transport calls `wire` twice per attempt: once before it does anything observable
+     * (the revalidation point) and once when the request is on the wire (the counting point).
+     * `checked`/`counted` keep a WS→HTTP fallback from counting the same ticket twice.
+     */
+    let checked = false;
+    let counted = false;
+    let skip = false;
+    // Fail-closed has to hold at real dispatch time too: the identity can change between this
+    // decision and the wire call, and a rejected dispatch must not be published as injected.
+    // Ticket mode decides applicability on its own: the generic `mode` knob is a separate layer,
+    // and a request that already carries a structurally valid state of its own is not a ticket
+    // miss. `stateApplies` cannot be reused here because it would tie fail-closed to generic mode.
+    const failClosed = config.fallback === "closed" && !parseState(existing, scope.plan, this.config.ttl_seconds, now);
+    // Report a refusal where it is decided, so the counter always matches the audit event and a
+    // dispatch that never reached the transport is still visible.
+    if (blocked && failClosed) {
+      this.ticketOutcome(scope, "reject", blocked, blocked === "ticket_unverified" || blocked === "ticket_expired" ? "ticket_unverified" : "ticket_revalidation_failed");
+      throw new CodexApiError(400, blocked);
+    }
+    return {
+      // `strictMissing` belongs to the generic `fallback` knob; ticket mode has its own
+      // explicit fail-open/fail-closed decision above.
+      strictMissing: false,
+      value: ticket?.value,
+      wire: (kind, dispatched) => {
+        if (kind === "reuse") {
+          this.ticketOutcome(scope, "skip", "reused_ws_not_mutated", "ticket_reused_skipped");
+          return;
+        }
+        if (!checked) {
+          checked = true;
+          // Revalidation at true dispatch time: the identity, credential and business route can
+          // all change between selection and the wire, and a ticket bound to the old ones must
+          // not be shipped. Absent ticket is a different refusal from a binding that drifted.
+          const current = live();
+          const drifted = !current || !entry || current.identity !== entry.identity || current.credential !== entry.credential
+            || current.routeId !== entry.routeId;
+          const expired = ticket !== null && !ticketStore.usable(scope.entryId, scope.model, bound, this.now());
+          const reason = drifted || expired ? "ticket_revalidation_failed" : ticket ? null : "ticket_unverified";
+          if (reason !== null) {
+            this.ticketOutcome(scope, "reject", reason, reason);
+            skip = true;
+            if (failClosed) throw new CodexApiError(drifted || expired ? 409 : 400, reason);
+            return;
+          }
+        }
+        if (!dispatched || skip || counted) return;
+        counted = true;
+        if (plan.configEpoch === this.configEpoch) ticketStore.markUsed(scope.entryId, scope.model, bound, now);
+        plan.confirmed = true;
+        this.ticketOutcome(scope, "inject", WIRE_RESULTS[kind], "ticket_injected");
+      },
+      observe: () => { /* the ticket is only ever produced by the ticket probe */ },
+      complete: () => {
+        if (plan.confirmed) ticketStore.complete(scope.entryId, scope.model, bound);
+      },
+    };
+  }
+  /** The ticket-layer counters, folded into the overview summary. Never carries a raw state. */
+  private ticketEvent(scope: Scope, action: string, result: string): void {
+    this.ticketEvents.push({ id: randomUUID(), at: iso(this.now())!, entry_id: scope.entryId, model: scope.model,
+      source: "ticket", action, result, length: null, blocks: null, reason: result,
+      observed_blocks: null, expected_blocks: null, upstream_model: null, verdict: null, route_id: scope.routeId, usage: null });
+    if (this.ticketEvents.length > 100) this.ticketEvents.shift();
+  }
+  /** Publish a ticket decision; `counter` bumps the summary counter when the decision is one. */
+  private ticketOutcome(scope: Scope, action: string, reason: string, counter: TicketCounter | null): void {
+    if (counter !== null) this.ticketCounts[counter]++;
+    this.ticketEvent(scope, action, reason);
+  }
+  /**
+   * Opt-in harvest round: a synthetic request over the dedicated `harvest_proxy_url`, then,
+   * when it produced an exact target candidate, one revalidation through the account's own
+   * business route. A ticket only ever becomes `verified` on that second, business-route pass;
+   * the dedicated proxy can never authorize injection by itself.
+   *
+   * Uses neither the generic snapshot nor the generic probe budget/cooldown state, but keeps
+   * the guards the operator can see: singleflight, bounded global concurrency, abort on
+   * pause/config change and a round timeout.
+   */
+  async harvest(entryId: string, model: string): Promise<string> {
+    if (!this.config.ticket.enabled) return "disabled";
+    if (this.config.ticket.harvest_proxy_url === null) return "harvest_proxy_missing";
+    const epoch = this.configEpoch;
+    return this.ticketRound(entryId, model, async (scope, signal, reserve) => {
+      const observation = await this.ticketObservation(this.harvestTransport, scope, signal, reserve);
+      if (!observation) return "transport_error";
+      // Configuration or scope changed while the harvest ran: this evidence belongs to a
+      // decision that is no longer the current one, so it must not move the stored ticket.
+      if (this.configEpoch !== epoch || !this.config.ticket.enabled || !this.current(this.session(scope)!)) return "transport_error";
+      const config = this.config.ticket;
+      const reason = ticketStore.commit(scope, model, observation, config, this.config.ttl_seconds, this.now(), false);
+      this.ticketOutcome(scope, "harvest", reason, null);
+      // A candidate the account's own business route has not re-run is not a ticket yet.
+      if (!targetCandidate(observation.value, observation.model, model, config, this.config.ttl_seconds, this.now())) return reason;
+      return this.ticketProbeRound(scope, signal, reserve);
+    });
+  }
+  /**
+   * One business-route revalidation pass: the stored candidate is dispatched through the
+   * business route and must complete with the requested model before a ticket may be verified.
+   */
+  private async ticketProbeRound(scope: Scope, signal: AbortSignal, reserve: () => boolean): Promise<string> {
+    const ticket = ticketStore.get(scope.entryId, scope.model);
+    if (!ticket?.value) return "ticket_unverified";
+    const live = this.resolve?.(scope.entryId, scope.model);
+    if (live && ticket.binding !== ticketBinding(live)) {
+      // The stored candidate belongs to another credential or business route: not revalidatable here.
+      this.ticketOutcome(scope, "reject", "ticket_revalidation_failed", null);
+      return "ticket_revalidation_failed";
+    }
+    this.ticketCounts.ticket_revalidation_attempts++;
+    const revalidate = this.revalidateTransport;
+    // No business-route transport means no revalidation evidence: the stored decision stands.
+    if (!revalidate) return "ticket_unverified";
+    const value = ticket.value;
+    const observation = await this.ticketObservation((sc, attemptSignal, attemptReserve) =>
+      revalidate(sc, value, attemptSignal, attemptReserve), scope, signal, reserve);
+    if (!observation) return "ticket_unverified";
+    const confirmed = observation.model === scope.model && observation.completed && observation.value === value;
+    const reason = ticketStore.commit(scope, scope.model, observation, this.config.ticket, this.config.ttl_seconds, this.now(), confirmed);
+    this.ticketOutcome(scope, confirmed ? "accept" : "reject", reason, null);
+    return reason;
+  }
+  /** Sanitized evidence of one round, or null when the round produced none. */
+  private async ticketObservation(send: TicketSend | undefined, scope: Scope, signal: AbortSignal, reserve: () => boolean): Promise<TicketObservation | null> {
+    if (!send) return null;
+    const result = await send(scope, signal, reserve);
+    return { value: result.value, completed: result.completed === true, model: safeModelName(result.model) ?? null };
+  }
+  /**
+   * Shared ticket-round envelope: singleflight per scope, bounded global concurrency, timeout
+   * and abort on pause/config change.
+   */
+  private async ticketRound(entryId: string, model: string, run: (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<string>): Promise<string> {
+    const key = keyOf({ entryId, model });
+    const running = this.ticketRounds.get(key);
+    if (running) return running;
+    if (this.ticketRunning >= 2) return "concurrency_limit";
+    const scope = this.resolve?.(entryId, model);
+    if (!scope) return "ineligible";
+    const s = this.session(scope);
+    if (!s) return "capacity";
+    if (s.stopped) return "paused";
+    const controller = new AbortController();
+    this.ticketControllers.set(key, controller);
+    const timeout = setTimeout(() => controller.abort(), this.config.probe_timeout_seconds * 1000);
+    this.ticketRunning++;
+    const round = run(scope, controller.signal, () => !controller.signal.aborted)
+      .catch(() => "transport_error")
+      .finally(() => { clearTimeout(timeout); this.ticketRunning--; this.ticketControllers.delete(key); this.ticketRounds.delete(key); });
+    this.ticketRounds.set(key, round);
+    return round;
+  }
+  /**
+   * Refresh verified tickets at the generic refresh boundary, and re-harvest a ticket a single
+   * signal withdrew, at the cooldown cadence. Both are bounded by the round guards.
+   */
+  private refreshTickets(): void {
+    const config = this.config.ticket;
+    if (!config.enabled || config.harvest_proxy_url === null || !this.harvestTransport) return;
+    const now = this.now();
+    for (const view of ticketStore.list(now)) {
+      if (this.ticketRounds.has(keyOf({ entryId: view.entry_id, model: view.model }))) continue;
+      if (view.state === "verified") {
+        if (view.expires_at === null || Date.parse(view.expires_at) - now > this.config.refresh_before_seconds * 1000) continue;
+      } else if (view.state === "revalidating") {
+        const record = ticketStore.get(view.entry_id, view.model);
+        if (!record || now - Date.parse(record.updatedAt) < this.config.cooldown_seconds * 1000) continue;
+      } else continue;
+      void this.harvest(view.entry_id, view.model);
+    }
   }
   /**
    * Publish an observation. Returns the outcome and, on rejection, the first failing rule so the
@@ -249,7 +504,7 @@ export class TurnStateRuntime {
     this.event(s, source, "accept", code, accepted, usage, null, state.blocks, classified.expectedBlocks, upstreamModel, classified.verdict);
     return { accepted: true, code, reason: null, observedBlocks: state.blocks, expectedBlocks: classified.expectedBlocks };
   }
-  private event(s: Session, source: Event["source"], action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage, reason?: string | null, observedBlocks?: number | null, expectedBlocks?: number | null, upstreamModel?: string | null, verdict?: StateCheckVerdict | null): void {
+  private event(s: Session, source: EventSource, action: string, result: string, state?: ParsedState | null, usage?: ProbeUsage, reason?: string | null, observedBlocks?: number | null, expectedBlocks?: number | null, upstreamModel?: string | null, verdict?: StateCheckVerdict | null): void {
     this.events.push({ id: randomUUID(), at: iso(this.now())!, entry_id: s.scope.entryId, model: s.scope.model,
       source, action, result, length: state?.length ?? null, blocks: state?.blocks ?? null,
       reason: reason ?? null,
@@ -423,6 +678,9 @@ export class TurnStateRuntime {
     s.generation++;
     s.abort?.abort();
     s.active = null; s.ready = null; s.businessUntil = 0;
+    // Scoped ticket cancellation: an in-flight round keeps its own abort handle, so pause/clear
+    // cannot silently publish a harvest for a scope the operator just paused.
+    this.ticketControllers.get(keyOf({ entryId, model }))?.abort();
     if (action === "stop") s.stopped = true;
     if (action === "resume") s.stopped = false;
     s.diagnostic = s.stopped ? "paused" : s.scope.unsupported ?? (action === "resume" ? "resumed" : "cleared");
@@ -430,6 +688,8 @@ export class TurnStateRuntime {
     return s.diagnostic;
   }
   tick(): void {
+    // Ticket refresh is its own decision layer: it runs whether or not generic mode is enabled.
+    this.refreshTickets();
     if (!this.enabled()) return;
     for (const [key, s] of this.sessions) {
       if (!this.current(s)) {
@@ -470,10 +730,12 @@ export class TurnStateRuntime {
         last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
     });
     return { schema: "codex-proxy.turn-state-overview.v1" as const, server_time: iso(this.now())!, epoch: this.epoch,
-      config: { ...this.config }, summary: { sessions: sessions.length, usable: sessions.filter(s => s.active?.usable).length,
+      config: { ...this.config, ticket: { ...this.config.ticket, harvest_proxy_url: maskProxyUrl(this.config.ticket.harvest_proxy_url) } }, summary: { sessions: sessions.length, usable: sessions.filter(s => s.active?.usable).length,
         ready: sessions.filter(s => s.ready?.usable).length, collecting: sessions.filter(s => s.phase === "collecting").length,
-        expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length, ...this.counts },
-      sessions, events: this.events.map(e => ({ ...e })) };
+        expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length,
+        ...this.counts, ...this.ticketCounts },
+      tickets: ticketStore.list(this.now()),
+      sessions, events: [...this.events, ...this.ticketEvents].map(e => ({ ...e })) };
   }
 }
 export const turnStateRuntime = new TurnStateRuntime();

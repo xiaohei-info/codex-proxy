@@ -42,7 +42,7 @@ export function debugDump(kind: string, payload: Record<string, unknown>): void 
   }
   try {
     // Chunk boundaries can bisect metadata keys and values; stateless regex redaction cannot secure them.
-    const safePayload = kind === "upstream-chunk" && turnStateRuntime.config.enabled && turnStateRuntime.config.mode !== "off"
+    const safePayload = kind === "upstream-chunk" && turnStateRuntime.redactsStreams()
       ? { ...payload, chunk: "[experimental stream content withheld]" } : payload;
     const line = redactTurnStateJson({ ts: Date.now(), kind, ...safePayload }) + "\n";
     fs.appendFileSync(DUMP_PATH, line);

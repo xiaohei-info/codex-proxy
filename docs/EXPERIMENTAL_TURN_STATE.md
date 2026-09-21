@@ -106,11 +106,73 @@ code strings, timestamp strings and state fingerprints; unknown valid codes rema
 Proxy-only mutation endpoints:
 
 - `POST /admin/turn-state/config`: complete validated configuration object.
-- `POST /admin/turn-state/action`: `{action: "probe"|"clear"|"stop"|"resume", entry_id, model, confirmed: true}`.
+- `POST /admin/turn-state/action`: `{action: "probe"|"harvest"|"clear"|"stop"|"resume", entry_id, model, confirmed: true}`.
+
+## Verified 292 ticket mode (opt-in, default off)
+
+A separate decision layer over the same runtime. It is **not** the generic snapshot: it never
+reads or writes `active`/`ready`, and generic mode behaves identically whether it is on or off.
+
+```yaml
+experimental_turn_state:
+  ticket:
+    enabled: false
+    target_length: 292        # a padded personal envelope; keep 4-aligned
+    harvest_proxy_url: null   # dedicated synthetic egress, masked in the overview
+    fallback: open            # open | closed
+    revoke_after_signals: 2   # consecutive misses before revoking a verified ticket
+```
+
+A ticket must clear every stage, in order; a later stage never weakens an earlier one:
+
+1. **Harvest** (synthetic HTTP only) leaves through `harvest_proxy_url`. Unset means no harvest at
+   all — ticket mode never falls back to the account's business egress for harvesting.
+2. **Candidate** must be `classifyState`-valid *and* exactly `target_length` (290 unpadded and 292
+   padded are the same value). The response must have reached `response.completed` with a
+   `completed` status, and the upstream must have disclosed the **exact requested model**.
+3. **Revalidation** re-dispatches that candidate through the account's *current business route*,
+   same account and model, and requires the same completion and model evidence. Only this pass
+   can set `verified`; the dedicated proxy can never authorize injection by itself.
+
+**Binding.** A ticket is bound to entry, model, credential identity and business route identity.
+A credential refresh, base-URL change or route change makes it unusable (reported
+`ticket_revalidation_failed`) until it is re-harvested. Injection happens at true dispatch time,
+not at selection time, so a rotation between the two cannot ship a stale ticket.
+
+**Injection.** HTTP and **new WebSocket handshakes** only. A reused pooled socket skips override
+and reports `ws_connection_reused`; its handshake and `previous_response_id` continuity are intact.
+A WS→HTTP fallback counts one injection, not two. The generic snapshot still wins when it has a
+value; a ticket is a stricter source for the same header, never a competing one.
+
+**Fail-open/fail-closed.** `open` dispatches without a ticket. `closed` rejects a fresh dispatch
+that would otherwise need one — before anything is sent — and leaves a request that already carries
+a structurally valid state of its own untouched. Applicability is ticket-mode's own decision; the
+generic `mode`/`fallback` knobs are unaffected.
+
+**312 is a signal, not a revocation.** One non-target (or missing-model, or incomplete) observation
+marks a verified ticket `revalidating`: the value is kept, its usability is withdrawn, and a
+re-harvest is scheduled at the cooldown cadence. Revocation needs `revoke_after_signals`
+consecutive misses, or a confirmed contradiction (the upstream named a different model). Verified
+tickets are refreshed ahead of expiry by `refresh_before_seconds`.
+
+**Bounds.** One round per account/model at a time, global concurrency 2, `probe_timeout_seconds`
+timeout, and abort on pause, `clear`, shutdown or any config change. Rounds are keyed per scope, so
+pausing one scope cancels only its own round.
+
+**Storage and exposure.** Tickets are the one persisted piece of this experiment:
+`<dataDir>/codex-tickets.json`, written atomically (tmp + rename) with mode `0600`, pruned and
+capped. The raw value never leaves the store: the overview exposes a length, fingerprint, state,
+reason and timestamps only, and the masked `harvest_proxy_url` round-trips through the UI without
+exposing or losing its credential. Raw streamed bytes are withheld from debug dumps while ticket
+mode is active, because a state can span arbitrary chunk boundaries.
+
+**Observe first.** Defaults are `enabled: false` and `fallback: open`. Enable harvest and
+verification first, confirm real 292 yield, business-route revalidation success, model-match rate,
+ticket lifetime and 312 frequency, and only then consider `fallback: closed`.
 
 To roll back operationally, save `enabled: false` (and optionally `active_enabled: false`,
-`mode: off`). In-flight probes are aborted and cannot publish. Restart is not required.
-Do not enable on production merely because local mocked tests pass.
+`mode: off`). In-flight probes and ticket rounds are aborted and cannot publish. Restart is not
+required. Do not enable on production merely because local mocked tests pass.
 
 ## Reference and deliberate differences
 

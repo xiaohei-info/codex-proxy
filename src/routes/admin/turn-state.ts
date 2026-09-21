@@ -7,7 +7,7 @@ import { TurnStateConfigSchema } from "../../experimental/turn-state/policy.js";
 import { turnStateRuntime, type TurnStateRuntime } from "../../experimental/turn-state/runtime.js";
 
 const ActionSchema = z.object({
-  action: z.enum(["probe", "clear", "stop", "resume"]),
+  action: z.enum(["probe", "harvest", "clear", "stop", "resume"]),
   entry_id: z.string().min(1).max(256),
   model: z.string().min(1).max(256).regex(/^[a-zA-Z0-9._:/-]+$/),
   confirmed: z.literal(true),
@@ -29,6 +29,10 @@ export function createTurnStateRoutes(runtime: TurnStateRuntime = turnStateRunti
     try { input = JSON.parse(raw); } catch { return c.json({ error: "invalid_config" }, 400); }
     const parsed = TurnStateConfigSchema.safeParse(input);
     if (!parsed.success) return c.json({ error: "invalid_config" }, 400);
+    // The GET returns the harvest proxy with its credential masked; posting that mask back must
+    // keep the stored URL, matching the existing "empty secret keeps the existing key" rule.
+    if (parsed.data.ticket.harvest_proxy_url?.includes(":***@") === true)
+      parsed.data.ticket.harvest_proxy_url = turnStateRuntime.config.ticket.harvest_proxy_url;
     try {
       mutateYaml(getLocalConfigPath(), data => { data.experimental_turn_state = parsed.data; });
       reloadAllConfigs();
@@ -44,7 +48,7 @@ export function createTurnStateRoutes(runtime: TurnStateRuntime = turnStateRunti
     const parsed = ActionSchema.safeParse(input);
     if (!parsed.success) return c.json({ error: "invalid_action" }, 400);
     const { entry_id, model, action } = parsed.data;
-    const result = action === "probe" ? await runtime.probe(entry_id, model) : runtime.action(entry_id, model, action);
+    const result = action === "probe" || action === "harvest" ? await runtime[action](entry_id, model) : runtime.action(entry_id, model, action);
     return c.json({ result });
   });
   return app;

@@ -1,6 +1,37 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
+/** Proxy URL rules shared with the proxy pool: scheme allowlist, origin only, port 1-65535. */
+export function validProxyUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:", "socks5:", "socks5h:"].includes(url.protocol)) return false;
+    if (url.pathname !== "" && url.pathname !== "/") return false;
+    if (url.search !== "" || url.hash !== "") return false;
+    return url.port === "" || (Number(url.port) >= 1 && Number(url.port) <= 65535);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Opt-in Verified 292 ticket layer, layered on the generic runtime.
+ * `target_length` is the exact padded envelope length a ticket must have: a
+ * personal envelope is 57 + 16*10 = 217 bytes, i.e. 292 padded base64 chars
+ * (an 11-block envelope is 312 and is not a target). `harvest_proxy_url` is used
+ * by the synthetic HTTP probe only and never by business dispatch.
+ */
+export const TicketConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  target_length: z.number().int().min(73).max(2048).refine(v => v % 4 === 0, { message: "target_length must be a padded base64 length" }).default(292),
+  harvest_proxy_url: z.string().max(512).refine(validProxyUrl, { message: "harvest_proxy_url must be an http/https/socks5/socks5h origin without path, query or fragment" }).nullable().default(null),
+  /** `open` keeps dispatching without a verified ticket; `closed` rejects a fresh applicable dispatch. */
+  fallback: z.enum(["open", "closed"]).default("open"),
+  /** Consecutive upstream misses that revoke a verified ticket; one miss only marks it revalidating. */
+  revoke_after_signals: z.number().int().min(1).max(10).default(2),
+}).strict();
+export type TicketConfig = z.infer<typeof TicketConfigSchema>;
+
 export const TurnStateConfigSchema = z.object({
   enabled: z.boolean().default(false),
   mode: z.enum(["off", "observe", "replace", "always"]).default("off"),
@@ -13,6 +44,7 @@ export const TurnStateConfigSchema = z.object({
   probe_timeout_seconds: z.number().int().min(1).max(60).default(20),
   cooldown_seconds: z.number().int().min(180).max(3600).default(180),
   max_attempts_per_round: z.number().int().min(1).max(2).default(2),
+  ticket: TicketConfigSchema.default({}),
 }).strict().refine(c => c.refresh_before_seconds < c.ttl_seconds - 30, { message: "refresh must precede expiry safety margin" });
 export type TurnStateConfig = z.infer<typeof TurnStateConfigSchema>;
 export type Plan = "personal" | "team";
@@ -147,6 +179,14 @@ export function classifyState(value: unknown, plan: Plan, ttl: number, now: numb
 /** Structural heuristic only: not a signature, model identity, or quality check. */
 export function parseState(value: unknown, plan: Plan, ttl: number, now: number): ParsedState | null {
   return classifyState(value, plan, ttl, now).state;
+}
+
+/**
+ * Which dispatches must carry a turn state. Single spelling shared by the injection
+ * runtime and the ticket layer, so both decide applicability identically.
+ */
+export function stateApplies(mode: TurnStateConfig["mode"], existing: string | undefined, plan: Plan, ttl: number, now: number): boolean {
+  return mode === "always" || (mode === "replace" && !!existing && !parseState(existing, plan, ttl, now));
 }
 
 export function isCompactionTrigger(input: unknown[]): boolean {
