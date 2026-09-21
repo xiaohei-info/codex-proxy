@@ -11,7 +11,7 @@ const choices = {
   account_mode: ["auto", "personal", "team"],
   ticketFallback: ["open", "closed"],
 };
-const ticketDefaults: TurnStateConfig["ticket"] = { enabled: false, target_length: 292, harvest_proxy_url: null, fallback: "open", revoke_after_signals: 2, max_entries: 200 };
+const ticketDefaults: TurnStateConfig["ticket"] = { enabled: false, target_length: 292, harvest_proxy_url: null, fallback: "open", revoke_after_signals: 2 };
 
 export function TurnStateSettings() {
   const t = useT();

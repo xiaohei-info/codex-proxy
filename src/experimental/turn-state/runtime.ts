@@ -277,7 +277,9 @@ export class TurnStateRuntime {
    */
   ticketBegin(scope: Scope, existing: string | undefined, live: () => Scope | null): Attempt | null {
     const config = this.config.ticket;
-    if (!config.enabled || scope.plan !== "personal" || scope.unsupported) return null;
+    // Ticket mode is a sub-switch of the experiment: the master switch gates it too, so a
+    // disabled experiment can never harvest, inject or accept a manual round.
+    if (!this.enabled() || !config.enabled || scope.plan !== "personal" || scope.unsupported) return null;
     const s = this.session(scope);
     if (!s || s.stopped) return null;
     const epoch = this.configEpoch;
@@ -371,7 +373,7 @@ export class TurnStateRuntime {
    * pause/config change and a round timeout.
    */
   async harvest(entryId: string, model: string): Promise<string> {
-    if (!this.config.ticket.enabled) return "disabled";
+    if (!this.enabled() || !this.config.ticket.enabled) return "disabled";
     if (this.config.ticket.harvest_proxy_url === null) return "harvest_proxy_missing";
     const epoch = this.configEpoch;
     return this.ticketRound(entryId, model, async (scope, signal, reserve) => {
@@ -395,6 +397,11 @@ export class TurnStateRuntime {
   private async ticketProbeRound(scope: Scope, signal: AbortSignal, reserve: () => boolean): Promise<string> {
     const ticket = ticketStore.get(scope.entryId, scope.model);
     if (!ticket?.value) return "ticket_unverified";
+    // Revalidation leaves through the account's own business egress, so it obeys the same
+    // account-level auth/quota guard as active probing.
+    const session = this.session(scope);
+    const blocked = session ? this.probeBlock(session) : null;
+    if (blocked) return blocked;
     const live = this.resolve?.(scope.entryId, scope.model);
     if (live && ticket.binding !== ticketBinding(live)) {
       // The stored candidate belongs to another credential or business route: not revalidatable here.
@@ -438,8 +445,18 @@ export class TurnStateRuntime {
     this.ticketControllers.set(key, controller);
     const timeout = setTimeout(() => controller.abort(), this.config.probe_timeout_seconds * 1000);
     this.ticketRunning++;
-    const round = run(scope, controller.signal, () => !controller.signal.aborted)
-      .catch(() => "transport_error")
+    // Ticket rounds spend the same hard 6/hour/account dispatch budget as active probing:
+    // every real harvest or revalidation dispatch is a real upstream request. A round that
+    // ran out of budget reports `budget_exhausted` rather than an ambiguous transport failure.
+    let denied = false;
+    const reserve = () => {
+      if (controller.signal.aborted) return false;
+      if (!this.budget(scope.entryId)) { denied = true; return false; }
+      return true;
+    };
+    const round = run(scope, controller.signal, reserve)
+      .then(result => denied ? "budget_exhausted" : result)
+      .catch(() => denied ? "budget_exhausted" : "transport_error")
       .finally(() => { clearTimeout(timeout); this.ticketRunning--; this.ticketControllers.delete(key); this.ticketRounds.delete(key); });
     this.ticketRounds.set(key, round);
     return round;
@@ -450,7 +467,8 @@ export class TurnStateRuntime {
    */
   private refreshTickets(): void {
     const config = this.config.ticket;
-    if (!config.enabled || config.harvest_proxy_url === null || !this.harvestTransport) return;
+    // The master switch gates ticket refresh exactly as it gates ticket injection.
+    if (!this.enabled() || !config.enabled || config.harvest_proxy_url === null || !this.harvestTransport) return;
     const now = this.now();
     for (const view of ticketStore.list(now)) {
       if (this.ticketRounds.has(keyOf({ entryId: view.entry_id, model: view.model }))) continue;
@@ -537,16 +555,24 @@ export class TurnStateRuntime {
     }
     return null;
   }
+  /**
+   * The shared hard 6/hour/account dispatch budget. Pure: no session diagnostics and no probe
+   * counters, so both active probing and ticket rounds spend from the same rolling window.
+   */
+  private budget(entryId: string): boolean {
+    const times = this.budgetTimes(entryId);
+    if (times.length >= 6 || (!this.budgets.has(entryId) && this.budgets.size >= 200)) return false;
+    times.push(this.now()); this.budgets.set(entryId, times);
+    return true;
+  }
   private reserve(s: Session): boolean {
     if (this.probeBlock(s)) return false;
-    const times = this.budgetTimes(s.scope.entryId);
-    if (times.length >= 6 || (!this.budgets.has(s.scope.entryId) && this.budgets.size >= 200)) {
+    if (!this.budget(s.scope.entryId)) {
       s.diagnostic = "budget_exhausted";
-      s.nextProbe = Math.max(s.nextProbe, (times[0] ?? this.now()) + 3600_000);
+      s.nextProbe = Math.max(s.nextProbe, (this.budgetTimes(s.scope.entryId)[0] ?? this.now()) + 3600_000);
       return false;
     }
     s.nextProbe = Math.max(s.nextProbe, this.now() + this.config.cooldown_seconds * 1000);
-    times.push(this.now()); this.budgets.set(s.scope.entryId, times);
     s.probeCount++; this.counts.active_probes++;
     this.event(s, "active", "probe", "dispatched");
     return true;
@@ -735,7 +761,9 @@ export class TurnStateRuntime {
         expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length,
         ...this.counts, ...this.ticketCounts },
       tickets: ticketStore.list(this.now()),
-      sessions, events: [...this.events, ...this.ticketEvents].map(e => ({ ...e })) };
+      // Ticket events share the generic 200-event cap: the merged list is truncated to the
+      // newest 200 so the emitted snapshot always satisfies the frozen Keeper contract.
+      sessions, events: [...this.events, ...this.ticketEvents].slice(-200).map(e => ({ ...e })) };
   }
 }
 export const turnStateRuntime = new TurnStateRuntime();

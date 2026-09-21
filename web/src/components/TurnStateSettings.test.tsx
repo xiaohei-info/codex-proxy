@@ -37,3 +37,27 @@ it("shows unavailable rather than healthy zero data", async () => {
   expect(await screen.findByText(/Unavailable or save failed/)).toBeTruthy();
   expect(screen.queryByText("Save configuration")).toBeNull();
 });
+it("posts a ticket config the backend schema accepts", async () => {
+  // The settings page and the zod config schema must agree: a strict schema rejects any
+  // extra key, so a stale default here would make every save fail with invalid_config.
+  const { TurnStateConfigSchema } = await import("../../../src/experimental/turn-state/policy");
+  let posted: Record<string, unknown> = {};
+  const saved = { ...config };
+  const fetcher = vi.fn(async (_url: string, options?: { method?: string; body?: string }) => {
+    if (options?.method === "POST" && _url.endsWith("config")) posted = JSON.parse(options.body ?? "{}");
+    return new Response(JSON.stringify({ config: saved, sessions: [] }));
+  });
+  vi.stubGlobal("fetch", fetcher);
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  render(<I18nProvider><TurnStateSettings /></I18nProvider>);
+  await screen.findByText("Save configuration");
+  // Touching any ticket field is what merges `ticketDefaults` into the posted payload, so a
+  // stale/unknown default key would reach the strict schema and make every save fail.
+  const checkboxes = screen.getAllByRole("checkbox");
+  fireEvent.click(checkboxes[checkboxes.length - 1]);
+  fireEvent.click(screen.getByText("Save configuration"));
+  await waitFor(() => expect(Object.keys(posted)).not.toHaveLength(0));
+  expect(posted.ticket).toBeTruthy();
+  const parsed = TurnStateConfigSchema.safeParse(posted);
+  expect(parsed.success).toBe(true);
+});

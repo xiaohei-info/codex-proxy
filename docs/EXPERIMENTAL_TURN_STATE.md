@@ -60,7 +60,9 @@ never advance the round-robin cursor. Use fixed/global/direct egress for this sl
   Restart clears them; configuration persists. Restart therefore resets the hourly budget.
   Counters are since runtime epoch, not durable history. No encrypted state persistence exists.
 
-Sessions/events are each capped at 200. Capacity fails closed for probing rather than
+Sessions/events are each capped at 200. The 200-event cap is shared: ticket-layer events are
+merged with the generic ones and the snapshot emits only the newest 200. Capacity fails closed
+for probing rather than
 resetting retained billing guards. The integration snapshot contains only bounded whitelist
 metadata and short digests of **state**, never credential digests, complete states or prompts.
 
@@ -158,6 +160,18 @@ tickets are refreshed ahead of expiry by `refresh_before_seconds`.
 **Bounds.** One round per account/model at a time, global concurrency 2, `probe_timeout_seconds`
 timeout, and abort on pause, `clear`, shutdown or any config change. Rounds are keyed per scope, so
 pausing one scope cancels only its own round.
+
+**Master switch.** Ticket mode is a sub-switch of this experiment, not a second experiment. With
+`enabled: false` (or `mode: off`) it neither harvests, injects, refreshes, nor accepts a manual
+`harvest` action: `harvest` returns `disabled` and a business dispatch is governed by the generic
+layer alone. `mode` and `fallback` remain generic knobs that ticket mode does not read.
+
+**Shared budget.** Every ticket round that reaches the network spends the same hard
+6-dispatches-per-account-per-rolling-hour budget as active probing — each harvest and each
+business-route revalidation is one real upstream request. Exhausting it reports
+`budget_exhausted`; no config change, `clear` or `resume` resets it. Harvest leaves through the
+dedicated proxy, so its rate limits are never attributed to the account's business route;
+revalidation does use the business route, so it also honors the account-level auth/quota guards.
 
 **Storage and exposure.** Tickets are the one persisted piece of this experiment:
 `<dataDir>/codex-tickets.json`, written atomically (tmp + rename) with mode `0600`, pruned and
