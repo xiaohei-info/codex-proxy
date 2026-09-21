@@ -93,7 +93,7 @@ export class TurnStateRuntime {
   private timer?: ReturnType<typeof setInterval>;
   private transport?: ProbeTransport;
   private resolve?: (entryId: string, model: string) => Scope | null;
-  private counts = { injection_count: 0, passive_observations: 0, active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0 };
+  private counts = { injection_count: 0, passive_observations: 0, passive_accepted: 0, passive_rejected: 0, active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0 };
   constructor(private now: () => number = Date.now) {}
 
   start(resolve: (entryId: string, model: string) => Scope | null, transport: ProbeTransport): void {
@@ -196,8 +196,15 @@ export class TurnStateRuntime {
         if (completed) return;
         completed = true;
         if (!c.passive_enabled || candidate === undefined || generation !== this.generation || scopeGeneration !== s.generation || !this.current(s)) return;
+        // passive_observations counts ATTEMPTS (a response carried a state worth
+        // classifying); the outcome is split like the active path so the UI can
+        // show "accepted / rejected" instead of presenting attempts as successes.
         s.observationCount++; this.counts.passive_observations++; s.lastObserved = this.now();
-        this.publish(s, candidate, revision, "passive");
+        const outcome = this.publish(s, candidate, revision, "passive");
+        // Keep the invariant accepted + rejected == observations so the two numbers
+        // always reconcile, and a discarded stale observation still counts as "not used".
+        if (outcome.accepted) this.counts.passive_accepted++;
+        else this.counts.passive_rejected++;
       },
     };
   }

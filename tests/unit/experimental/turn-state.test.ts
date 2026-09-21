@@ -224,6 +224,19 @@ describe("turn-state runtime", () => {
     expect(serialized).not.toContain("\\n");
     expect(overview.events.some(e => e.upstream_model !== null)).toBe(true);
   });
+  it("splits passive observations into accepted and rejected so attempts are not shown as successes", async () => {
+    const { runtime: r } = setup(async () => ({ completed: false }));
+    // One usable state: accepted.
+    publish(r, token());
+    // One wrong block count: classified, then rejected.
+    publish(r, token(NOW, 11));
+    const summary = r.overview().summary;
+    expect(summary.passive_observations).toBe(2);
+    expect(summary.passive_accepted).toBe(1);
+    expect(summary.passive_rejected).toBe(1);
+    // The two outcome counters must always reconcile with the attempt counter.
+    expect(summary.passive_accepted + summary.passive_rejected).toBe(summary.passive_observations);
+  });
   it("reports no_state when the upstream returned no state at all", async () => {
     const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, model: "model" }; });
     expect(await r.probe("entry", "model")).toBe("no_state");
