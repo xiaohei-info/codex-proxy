@@ -1,4 +1,7 @@
 node_modules/
+.pi/hindsight/
+**/__pycache__/
+*.py[cod]
 dist/
 dist-electron/
 release/
