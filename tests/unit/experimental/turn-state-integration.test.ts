@@ -43,10 +43,16 @@ describe("active probe HTTP/account integration", () => {
     expect(event.usage).toEqual({ input_tokens: 2, output_tokens: 1, reasoning_tokens: null });
     expect(JSON.stringify(runtime.overview())).not.toContain(entry.token);
   });
-  it("keeps the first authoritative mismatch on record but still accepts a structurally valid state", async () => {
+  it("refuses a state whose upstream model differs and records the substitution when accepted", async () => {
     // The upstream's first model claim wins as the observability signal; a later completion
-    // carrying the requested name must not erase it. Model mismatch is observational, so the
-    // valid envelope is still accepted rather than discarded.
+    // carrying the requested name must not erase it. By default a mismatch is a rejection.
+    fake.post.mockImplementation(async () => response([{ type: "response.created", response: { model: "wrong" } }, { type: "response.completed", response: { status: "completed", model: "actual" } }]));
+    expect(await runtime.probe(entry.id, "actual")).toBe("model_mismatch");
+    expect(runtime.overview().summary.usable).toBe(0);
+    expect(runtime.overview().events.some(e => e.result === "model_mismatch")).toBe(true);
+  });
+  it("accepts a substitution once mismatch_is_success is on and still records it", async () => {
+    runtime.update({ ...runtime.config, mismatch_is_success: true });
     fake.post.mockImplementation(async () => response([{ type: "response.created", response: { model: "wrong" } }, { type: "response.completed", response: { status: "completed", model: "actual" } }]));
     expect(await runtime.probe(entry.id, "actual")).toBe("accepted_model_mismatch");
     expect(runtime.overview().summary.usable).toBe(1);

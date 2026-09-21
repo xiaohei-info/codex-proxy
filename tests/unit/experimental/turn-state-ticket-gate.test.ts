@@ -49,10 +49,10 @@ beforeEach(() => {
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe("J. the master switch gates ticket mode (P1-1)", () => {
-  it("refuses a manual harvest while the experiment is disabled", async () => {
+  it("refuses a manual collection round while the experiment is disabled", async () => {
     const r = new TurnStateRuntime();
     const send = vi.fn(harvestOf(envelope()));
-    r.update({ enabled: false, mode: "off", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: false, mode: "off", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(send, confirms);
     try {
@@ -63,14 +63,14 @@ describe("J. the master switch gates ticket mode (P1-1)", () => {
 
   it("does not inject a ticket while the experiment is disabled, even one verified earlier", async () => {
     const r = new TurnStateRuntime();
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "always", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(harvestOf(envelope()), confirms);
     try {
       expect(await r.harvest(scope.entryId, scope.model)).toBe("ticket_verified");
       expect(ticketStore.usable(scope.entryId, scope.model, `${scope.identity}|${scope.credential}|${scope.routeId}`, Date.now())).not.toBeNull();
       // Same stored ticket, but the master switch is now off: it must not reach the wire.
-      r.update({ enabled: false, mode: "off", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+      r.update({ enabled: false, mode: "off", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
       expect(r.begin(scope, undefined, { identity: scope.identity, credential: scope.credential })).toBeNull();
     } finally { r.shutdown(); }
   });
@@ -79,14 +79,14 @@ describe("J. the master switch gates ticket mode (P1-1)", () => {
     let now = ticketNow();
     const r = new TurnStateRuntime(() => now);
     const send = vi.fn(harvestOf(envelope()));
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(send, confirms);
     try {
       await r.harvest(scope.entryId, scope.model);
       send.mockClear();
       // Disable the experiment, then move inside the refresh window and tick.
-      r.update({ enabled: false, mode: "off", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+      r.update({ enabled: false, mode: "off", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
       now = ticketNow() + 2_500_000;
       r.tick();
       await new Promise(resolve => setTimeout(resolve, 0));
@@ -115,7 +115,7 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
 
   it("caps harvest and revalidation dispatches at six per rolling hour", async () => {
     const r = new TurnStateRuntime();
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(countingHarvest(envelope()), countingConfirm);
     try {
@@ -131,7 +131,7 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
 
   it("does not reset the ticket budget on clear, resume or a config change", async () => {
     const r = new TurnStateRuntime();
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(countingHarvest(envelope()), countingConfirm);
     try {
@@ -140,7 +140,7 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
       const spent = dispatched.count;
       r.action(scope.entryId, scope.model, "clear");
       r.action(scope.entryId, scope.model, "resume");
-      r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+      r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
       expect(await r.harvest(scope.entryId, scope.model)).toBe("budget_exhausted");
       expect(dispatched.count).toBe(spent);
     } finally { r.shutdown(); }
@@ -149,7 +149,7 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
   it("keeps the active-probing budget and the ticket budget on the same counter", async () => {
     const r = new TurnStateRuntime();
     const send = vi.fn(harvestOf(envelope()));
-    r.update({ enabled: true, mode: "observe", active_enabled: true, ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async (_s, _a, reserve) => ({ completed: reserve(), value: envelope(), model: "model" }));
     r.startTicket(send, confirms);
     try {
@@ -165,7 +165,7 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
 describe("L. the snapshot stays inside the frozen 200-event contract (P0-2/P2-2)", () => {
   it("emits at most 200 events even when generic and ticket events are both full", async () => {
     const r = new TurnStateRuntime();
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(harvestOf(envelope()), confirms);
     try {

@@ -105,11 +105,12 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
   turnStateRuntime.start(resolve, (scope, signal, reserve) =>
     round(scope, signal, reserve, proxyPool.resolveProxyUrl(scope.entryId), true));
   turnStateRuntime.startTicket(
-    // A harvest only ever leaves through the dedicated proxy, and only when the operator set one.
+    // Active collection leaves through the dedicated egress when one is configured, and over the
+    // account's own business route when it is not — an unset proxy must still collect.
     (scope, signal, reserve) => {
-      const harvest = getConfig().experimental_turn_state?.ticket.harvest_proxy_url;
+      const harvest = getConfig().experimental_turn_state?.harvest_proxy_url;
       return harvest === null || harvest === undefined
-        ? Promise.resolve({ completed: false })
+        ? round(scope, signal, reserve, proxyPool.resolveProxyUrl(scope.entryId), true)
         : round(scope, signal, reserve, harvest, false);
     },
     // Revalidation must reproduce the real business dispatch: same account, same model, same route.

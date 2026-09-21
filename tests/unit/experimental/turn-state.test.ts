@@ -116,17 +116,29 @@ describe("turn-state runtime", () => {
     expect(r.overview().summary.rejected_probes).toBe(2);
     expect(await r.probe("entry", "model")).toBe("cooldown");
   });
-  it("accepts a valid state served by a different upstream model and records the mismatch", async () => {
+  it("rejects a structurally valid state whose upstream model differs", async () => {
     const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(), model: "other-model" }; });
-    // A model mismatch is observational: the envelope passes every structural rule, so it is used.
+    // `mismatch_is_success` defaults off: a state served under a different model is not trusted.
+    expect(await r.probe("entry", "model")).toBe("model_mismatch");
+    expect(r.overview().summary.usable).toBe(0);
+    expect(r.overview().summary.accepted_probes).toBe(0);
+    // One round makes up to `max_attempts_per_round` dispatches, so a rejected round counts twice.
+    expect(r.overview().summary.rejected_probes).toBe(2);
+    const reject = r.overview().events.find(e => e.result === "model_mismatch")!;
+    // The rejection carries the disclosed model and the observed shape, so the mismatch is
+    // explainable without re-deriving it; the envelope itself was structurally fine.
+    expect(reject.model).toBe("model");
+    expect(reject.observed_blocks).toBe(10);
+    expect(reject.expected_blocks).toBe(10);
+  });
+  it("accepts the same substitution when mismatch_is_success is on, still recording it", async () => {
+    const { runtime: r } = setup(async (_s, _a, reserve) => { reserve(); return { completed: true, value: token(), model: "other-model" }; });
+    r.update({ ...r.config, mismatch_is_success: true });
     expect(await r.probe("entry", "model")).toBe("accepted_model_mismatch");
     expect(r.overview().summary.usable).toBe(1);
-    expect(r.overview().summary.accepted_probes).toBe(1);
-    expect(r.overview().summary.rejected_probes).toBe(0);
     const accept = r.overview().events.find(e => e.result === "accepted_model_mismatch")!;
     expect(accept.model).toBe("model");
     expect(accept.blocks).toBe(10);
-    expect(accept.expected_blocks).toBe(10);
   });
   it.each([
     { name: "block_mismatch", blocks: 11, reason: "block_mismatch" },

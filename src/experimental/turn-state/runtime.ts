@@ -79,7 +79,11 @@ export interface Attempt {
    * layer can revalidate at dispatch time and count the outcome exactly once.
    */
   wire: (kind: WireKind, dispatched?: boolean) => void;
-  observe: (value: unknown) => void;
+  /**
+   * Report the state carried by a response, with the upstream model when the caller knows it.
+   * The model is what lets a mismatch be judged on the passive path exactly as on the active one.
+   */
+  observe: (value: unknown, model?: string | null) => void;
   complete: () => void;
 }
 export type WireKind = "http" | "new" | "reuse";
@@ -186,10 +190,10 @@ export class TurnStateRuntime {
   private enabled(): boolean { return this.config.enabled && this.config.mode !== "off"; }
   /**
    * Whether a raw turn state may appear in streamed bytes, so raw debug chunks cannot be
-   * safely redacted by stateless regex. Ticket mode harvests a raw state whether or not the
-   * generic layer is on, so it has to be included or a ticket would land in the dump.
+   * safely redacted by stateless regex. Active collection reads a raw state whether or not
+   * injection is on, so it has to be included or a collected state would land in the dump.
    */
-  redactsStreams(): boolean { return this.enabled() || this.config.ticket.enabled; }
+  redactsStreams(): boolean { return this.enabled() || this.config.active_enabled; }
   private current(s: Session): boolean {
     if (this.sessions.get(keyOf(s.scope)) !== s) return false;
     const scope = this.resolve?.(s.scope.entryId, s.scope.model);
@@ -271,17 +275,25 @@ export class TurnStateRuntime {
    * dispatch. Normalizing both here is what keeps the transport layer-agnostic.
    */
   private composeAttempts(generic: Attempt | null, ticket: Attempt | null): Attempt {
+    // The injected value is what the dispatch will actually carry, so "is a state missing" must
+    // be judged on the composed value: a supplied ticket satisfies `strict` exactly as a supplied
+    // snapshot does. Leaving the generic flag alone would reject a dispatch that has a state.
+    const value = generic?.value ?? ticket?.value;
     return {
       // The generic snapshot wins when it has one; a ticket is a stricter source for the same
-      // header, never a competing one. `strictMissing` likewise belongs to the generic knob.
-      value: generic?.value ?? ticket?.value,
-      strictMissing: generic?.strictMissing ?? false,
+      // header, never a competing one.
+      value,
+      // `strictMissing` is the generic layer's refusal. When the collection layer is active it
+      // owns that decision, because it is the stricter of the two and already reports a more
+      // specific reason (and was already counted); letting the generic flag fire first would
+      // surface a vaguer code than the one the audit counters recorded.
+      strictMissing: ticket === null && (generic?.strictMissing ?? false),
       wire: (kind, dispatched) => {
         // A refusal must be able to stop the dispatch, so ticket errors propagate unswallowed.
         ticket?.wire(kind, dispatched);
         try { if (dispatched) generic?.wire(kind, dispatched); } catch { /* diagnostics never break business output */ }
       },
-      observe: value => generic?.observe(value),
+      observe: (value, model) => generic?.observe(value, model),
       complete: () => { generic?.complete(); ticket?.complete(); },
     };
   }
@@ -296,6 +308,7 @@ export class TurnStateRuntime {
     const applies = stateApplies(c.mode, existing, scope.plan, c.ttl_seconds, this.now());
     const value = applies && this.usable(s.active) ? s.active.value : undefined;
     let candidate: unknown;
+    let candidateModel: string | null = null;
     let completed = false;
     return {
       value,
@@ -312,7 +325,13 @@ export class TurnStateRuntime {
           this.event(s, "injection", "apply", "dispatched");
         }
       },
-      observe: v => { if (c.passive_enabled && v !== undefined) candidate = v; },
+      observe: (v, model) => {
+        if (!c.passive_enabled || v === undefined) return;
+        candidate = v;
+        // The latest disclosure wins, so a model reported alongside the state is judged by the
+        // same policy the active path uses.
+        if (model !== undefined) candidateModel = safeModelName(model);
+      },
       complete: () => {
         if (completed) return;
         completed = true;
@@ -321,7 +340,8 @@ export class TurnStateRuntime {
         // classifying); the outcome is split like the active path so the UI can
         // show "accepted / rejected" instead of presenting attempts as successes.
         s.observationCount++; this.counts.passive_observations++; s.lastObserved = this.now();
-        const outcome = this.publish(s, candidate, revision, "passive");
+        if (candidateModel !== null) { s.lastUpstreamModel = candidateModel; s.modelMismatch = candidateModel !== s.scope.model; }
+        const outcome = this.publish(s, candidate, revision, "passive", undefined, candidateModel !== null && candidateModel !== s.scope.model, candidateModel);
         // Keep the invariant accepted + rejected == observations so the two numbers
         // always reconcile, and a discarded stale observation still counts as "not used".
         if (outcome.accepted) this.counts.passive_accepted++;
@@ -330,19 +350,26 @@ export class TurnStateRuntime {
     };
   }
   /**
-   * Ticket-mode decision for one business dispatch. Returns null when ticket mode does
-   * not cover this dispatch (disabled, non-personal plan, unsupported route, stopped
-   * scope), so the generic attempt alone governs it and generic behavior is unchanged.
+   * The collection-state decision for one business dispatch. Returns null when collection does
+   * not cover this dispatch (selection off, non-personal plan, unsupported route, stopped
+   * scope), so the generic snapshot alone governs it.
+   *
+   * This layer never decides *whether* a state is injected — `mode` owns that. It only supplies
+   * the collected candidate when one is trusted, which is why it stays silent under `observe`.
    *
    * `live` must resolve the credential/account/route identity this request will actually
    * dispatch WITH, so a ticket bound to a rotated credential or a changed business route
    * is refused instead of shipped.
    */
   private ticketAttempt(scope: Scope, existing: string | undefined, live: () => Scope | null): Attempt | null {
-    const config = this.config.ticket;
-    // Ticket mode is a sub-switch of the experiment: the master switch gates it too, so a
-    // disabled experiment can never harvest, inject or accept a manual round.
-    if (!this.enabled() || !config.enabled || scope.plan !== "personal" || scope.unsupported) return null;
+    const config = this.config;
+    // Active collection is the producer of tickets; `mode` alone decides whether one is used.
+    if (!this.config.active_enabled || scope.plan !== "personal" || scope.unsupported) return null;
+    // The experiment must be on, and `mode` owns injection for both layers: `observe` collects
+    // without ever supplying a value, and `replace` only participates when the request's own
+    // state is unusable. Reading the same shared rule the generic layer does keeps this one
+    // decision rather than two that can drift.
+    if (!this.enabled() || !stateApplies(config.mode, existing, scope.plan, config.ttl_seconds, this.now())) return null;
     const s = this.session(scope);
     if (!s || s.stopped) return null;
     const epoch = this.configEpoch;
@@ -364,10 +391,10 @@ export class TurnStateRuntime {
     let skip = false;
     // Fail-closed has to hold at real dispatch time too: the identity can change between this
     // decision and the wire call, and a rejected dispatch must not be published as injected.
-    // Ticket mode decides applicability on its own: the generic `mode` knob is a separate layer,
-    // and a request that already carries a structurally valid state of its own is not a ticket
-    // miss. `stateApplies` cannot be reused here because it would tie fail-closed to generic mode.
-    const failClosed = config.fallback === "closed" && !parseState(existing, scope.plan, this.config.ttl_seconds, now);
+    // Applicability stays this layer's own decision: the generic `mode` knob is a separate layer,
+    // and a request that already carries a structurally valid state of its own is not a miss.
+    // `stateApplies` cannot be reused here because it would tie fail-closed to generic mode.
+    const failClosed = this.config.fallback === "strict" && !parseState(existing, scope.plan, this.config.ttl_seconds, now);
     // Report a refusal where it is decided, so the counter always matches the audit event and a
     // dispatch that never reached the transport is still visible.
     if (blocked && failClosed) {
@@ -375,8 +402,8 @@ export class TurnStateRuntime {
       throw new CodexApiError(400, blocked);
     }
     return {
-      // `strictMissing` belongs to the generic `fallback` knob; ticket mode has its own
-      // explicit fail-open/fail-closed decision above.
+      // `strictMissing` belongs to the generic `fallback` knob; this layer has its own explicit
+      // fail-open/fail-closed decision above.
       strictMissing: false,
       value: ticket?.value,
       wire: (kind, dispatched) => {
@@ -426,30 +453,32 @@ export class TurnStateRuntime {
     this.ticketEvent(scope, action, reason);
   }
   /**
-   * Opt-in harvest round: a synthetic request over the dedicated `harvest_proxy_url`, then,
-   * when it produced an exact target candidate, one revalidation through the account's own
-   * business route. A ticket only ever becomes `verified` on that second, business-route pass;
-   * the dedicated proxy can never authorize injection by itself.
+   * One active collection round: a synthetic request over the dedicated egress when one is set,
+   * otherwise over the account's own business route. When `revalidate` is on and the round
+   * produced a candidate, one further pass re-dispatches that candidate through the business
+   * route to prove the upstream still accepts it before it is trusted.
    *
    * Uses neither the generic snapshot nor the generic probe budget/cooldown state, but keeps
    * the guards the operator can see: singleflight, bounded global concurrency, abort on
    * pause/config change and a round timeout.
    */
   async harvest(entryId: string, model: string): Promise<string> {
-    if (!this.enabled() || !this.config.ticket.enabled) return "disabled";
-    if (this.config.ticket.harvest_proxy_url === null) return "harvest_proxy_missing";
+    if (!this.enabled() || !this.config.active_enabled) return "disabled";
     const epoch = this.configEpoch;
     return this.ticketRound(entryId, model, async (scope, signal, reserve) => {
       const observation = await this.ticketObservation(this.harvestTransport, scope, signal, reserve);
       if (!observation) return "transport_error";
-      // Configuration or scope changed while the harvest ran: this evidence belongs to a
+      // Configuration or scope changed while the collection ran: this evidence belongs to a
       // decision that is no longer the current one, so it must not move the stored ticket.
-      if (this.configEpoch !== epoch || !this.config.ticket.enabled || !this.current(this.session(scope)!)) return "transport_error";
-      const config = this.config.ticket;
-      const reason = ticketStore.commit(scope, model, observation, config, this.config.ttl_seconds, this.now(), false);
+      if (this.configEpoch !== epoch || !this.config.active_enabled || !this.current(this.session(scope)!)) return "transport_error";
+      // A single-pass collection trusts its own observation; a two-pass one only records the
+      // candidate here and lets the revalidation pass decide.
+      const candidate = targetCandidate(observation.value, observation.model, model, this.config, this.config.ttl_seconds, this.now());
+      const singlePass = candidate !== null && !this.config.revalidate;
+      const reason = ticketStore.commit(scope, model, observation, this.config, this.config.ttl_seconds, this.now(), singlePass);
       this.ticketOutcome(scope, "harvest", reason, null);
-      // A candidate the account's own business route has not re-run is not a ticket yet.
-      if (!targetCandidate(observation.value, observation.model, model, config, this.config.ttl_seconds, this.now())) return reason;
+      if (candidate === null || singlePass || !this.config.revalidate) return reason;
+      // A candidate the account's own business route has not re-run is not trusted yet.
       return this.ticketProbeRound(scope, signal, reserve);
     });
   }
@@ -479,8 +508,9 @@ export class TurnStateRuntime {
     const observation = await this.ticketObservation((sc, attemptSignal, attemptReserve) =>
       revalidate(sc, value, attemptSignal, attemptReserve), scope, signal, reserve);
     if (!observation) return "ticket_unverified";
-    const confirmed = observation.model === scope.model && observation.completed && observation.value === value;
-    const reason = ticketStore.commit(scope, scope.model, observation, this.config.ticket, this.config.ttl_seconds, this.now(), confirmed);
+    const confirmed = observation.model !== null && observation.completed && observation.value === value
+      && (observation.model === scope.model || this.config.mismatch_is_success);
+    const reason = ticketStore.commit(scope, scope.model, observation, this.config, this.config.ttl_seconds, this.now(), confirmed);
     this.ticketOutcome(scope, confirmed ? "accept" : "reject", reason, null);
     return reason;
   }
@@ -529,9 +559,9 @@ export class TurnStateRuntime {
    * signal withdrew, at the cooldown cadence. Both are bounded by the round guards.
    */
   private refreshTickets(): void {
-    const config = this.config.ticket;
-    // The master switch gates ticket refresh exactly as it gates ticket injection.
-    if (!this.enabled() || !config.enabled || config.harvest_proxy_url === null || !this.harvestTransport) return;
+    // Refresh runs whenever active collection is on: an unset egress still collects over the
+    // business route, so gating on it here would freeze every stored ticket until restart.
+    if (!this.enabled() || !this.config.active_enabled || !this.harvestTransport) return;
     const now = this.now();
     for (const view of ticketStore.list(now)) {
       if (this.ticketRounds.has(keyOf({ entryId: view.entry_id, model: view.model }))) continue;
@@ -574,6 +604,16 @@ export class TurnStateRuntime {
       return { accepted: false, code: "stale_observation", reason: null, ...blocks };
     }
     const accepted = { ...state, version: revision };
+    // A disclosed model that differs from the requested one is a policy rejection unless the
+    // operator accepted substitutions. The envelope is still structurally valid, so this is
+    // reported as its own code rather than as a shape failure.
+    if (modelMismatch === true && !this.config.mismatch_is_success) {
+      s.diagnostic = "model_mismatch";
+      this.outcome(s, "model_mismatch", { code: "model_mismatch", reason: null, verdict: classified.verdict,
+        observed_blocks: classified.observedBlocks, expected_blocks: classified.expectedBlocks });
+      this.event(s, source, "reject", "model_mismatch", null, usage, null, classified.observedBlocks, classified.expectedBlocks, upstreamModel, classified.verdict);
+      return { accepted: false, code: "model_mismatch", reason: null, ...blocks };
+    }
     if (!this.usable(s.active)) s.active = accepted;
     else if (state.fingerprint !== s.active.fingerprint) s.ready = accepted;
     this.promote(s);
@@ -819,7 +859,7 @@ export class TurnStateRuntime {
         last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
     });
     return { schema: "codex-proxy.turn-state-overview.v1" as const, server_time: iso(this.now())!, epoch: this.epoch,
-      config: { ...this.config, ticket: { ...this.config.ticket, harvest_proxy_url: maskProxyUrl(this.config.ticket.harvest_proxy_url) } }, summary: { sessions: sessions.length, usable: sessions.filter(s => s.active?.usable).length,
+      config: { ...this.config, harvest_proxy_url: maskProxyUrl(this.config.harvest_proxy_url) }, summary: { sessions: sessions.length, usable: sessions.filter(s => s.active?.usable).length,
         ready: sessions.filter(s => s.ready?.usable).length, collecting: sessions.filter(s => s.phase === "collecting").length,
         expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length,
         ...this.counts, ...this.ticketCounts },

@@ -31,8 +31,8 @@ export function createTurnStateRoutes(runtime: TurnStateRuntime = turnStateRunti
     if (!parsed.success) return c.json({ error: "invalid_config" }, 400);
     // The GET returns the harvest proxy with its credential masked; posting that mask back must
     // keep the stored URL, matching the existing "empty secret keeps the existing key" rule.
-    if (parsed.data.ticket.harvest_proxy_url?.includes(":***@") === true)
-      parsed.data.ticket.harvest_proxy_url = turnStateRuntime.config.ticket.harvest_proxy_url;
+    if (parsed.data.harvest_proxy_url?.includes(":***@") === true)
+      parsed.data.harvest_proxy_url = turnStateRuntime.config.harvest_proxy_url;
     try {
       mutateYaml(getLocalConfigPath(), data => { data.experimental_turn_state = parsed.data; });
       reloadAllConfigs();

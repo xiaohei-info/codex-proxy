@@ -1,30 +1,33 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { getDataDir } from "../../paths.js";
-import { classifyState, type ParsedState, type TicketConfig } from "./policy.js";
+import { classifyState, type ParsedState, type TurnStateConfig } from "./policy.js";
 import { digest } from "./policy.js";
 import type { Scope } from "./runtime.js";
 
 /**
- * Verified 292 ticket store.
+ * Verified ticket store.
  *
- * A ticket is a stricter acceptance layer over the generic turn-state runtime: the
- * candidate must be an exact `target_length` envelope (292 = a padded personal
- * envelope), the harvest response must have completed, the upstream must have
- * disclosed the requested model, and the account's own business route must have
- * re-run the candidate and confirmed it. Tickets are bound to the account entry,
- * model, credential and business route identity, so a credential refresh or route
- * change makes them unusable until re-harvested.
+ * A ticket is the accepted form of a collected turn state: the candidate must pass
+ * `classifyState` for a personal envelope (10 blocks, i.e. 290/292 characters), the collection
+ * response must have completed, and the upstream model must agree with the requested one unless
+ * `mismatch_is_success` says otherwise. Tickets are bound to the account entry, model, credential
+ * and business route identity, so a credential refresh or route change makes them unusable until
+ * re-collected.
  *
- * Persistence is one JSON file under the gitignored data directory, written
- * atomically (tmp + rename) with owner-only permissions, mirroring the existing
- * proxies/fallback-upstream stores. The raw value never leaves this module: the
- * public view carries a length/fingerprint/state only, and no crypto is invented
- * because the repository has no key source to encrypt against.
+ * Whether the account's own business route must re-run the candidate before it is trusted is the
+ * caller's decision (`revalidate`); this store only records the decision it is handed.
+ *
+ * Persistence is one JSON file under the gitignored data directory, written atomically (tmp +
+ * rename) with owner-only permissions, mirroring the existing proxies/fallback-upstream stores.
+ * The raw value never leaves this module: the public view carries a length/fingerprint/state only,
+ * and no crypto is invented because the repository has no key source to encrypt against.
  */
 export type TicketState = "pending" | "revalidating" | "verified" | "revoked" | "expired";
 /** Credential+route binding a ticket was issued for: `identity|credential|routeId`. */
 export type TicketBinding = string;
+/** The subset of the experiment config that decides a candidate's fate. */
+export type TicketConfig = Pick<TurnStateConfig, "mismatch_is_success" | "revoke_after_signals">;
 
 export interface TicketObservation {
   value: string | undefined;
@@ -81,19 +84,22 @@ const safeCode = (value: string): string => CODE.test(value) ? value : "ticket_s
 export const TICKET_EXPIRY_MARGIN_MS = 30_000;
 /**
  * Canonical length of a candidate: base64url is accepted with or without padding, so a
- * 290-char unpadded envelope and a 292-char padded one are the same target.
+ * 290-char unpadded envelope and a 292-char padded one are the same value.
  */
 export const paddedLength = (length: number): number => length + (4 - length % 4) % 4;
 
 /**
- * The exact target candidate an observation carries, or null. Everything `classifyState`
- * enforces still applies; ticket mode adds the configured target length and the exact
- * requested model on top of it.
+ * The candidate an observation carries, or null. Everything `classifyState` enforces still
+ * applies — including the personal block count, which already pins the envelope to 290/292 —
+ * and a disclosed model that differs from the requested one is refused unless the operator
+ * accepted that substitution.
  */
 export function targetCandidate(value: unknown, observationModel: string | null, model: string, config: TicketConfig, ttlSeconds: number, now: number): ParsedState | null {
-  if (observationModel !== model) return null;
+  // An undisclosed model is never evidence, whatever the mismatch policy says.
+  if (observationModel === null) return null;
+  if (observationModel !== model && !config.mismatch_is_success) return null;
   const check = classifyState(value, "personal", ttlSeconds, now);
-  return check.state !== null && paddedLength(check.state.length) === config.target_length ? check.state : null;
+  return check.state;
 }
 
 export class TicketStore {
@@ -133,17 +139,17 @@ export class TicketStore {
     return "ticket_unverified";
   }
   /**
-   * Decide what a harvest round means for the stored ticket.
+   * Decide what a collection round means for the stored ticket.
    *
-   * `confirmed` is true only when the account's own business route re-ran this exact
-   * candidate and completed with the requested model: a harvest observation on its own never
-   * becomes `verified`.
+   * `confirmed` is true when this observation alone is sufficient evidence to trust the
+   * candidate: either the account's own business route re-ran it and returned the same value
+   * (`revalidate` on), or the operator accepted a single-pass collection (`revalidate` off).
    *
-   * A single miss (312 is an 11-block envelope, not a target; a missing model; an incomplete
-   * response) only marks a verified ticket `revalidating`, because none of them is evidence that
-   * the upstream revoked anything — the value is kept while its usability is withdrawn.
-   * Revocation requires a confirmed contradiction (the upstream named a different model) or
-   * `revoke_after_signals` consecutive misses.
+   * A single miss (an 11-block envelope, a missing model, an incomplete response) only marks a
+   * verified ticket `revalidating`, because none of them is evidence that the upstream revoked
+   * anything — the value is kept while its usability is withdrawn. Revocation requires a
+   * confirmed contradiction (the upstream named a different model and substitution is not
+   * accepted) or `revoke_after_signals` consecutive misses.
    */
   commit(scope: Scope, model: string, observation: TicketObservation | undefined, config: TicketConfig, ttlSeconds: number, now: number, confirmed: boolean): string {
     const key = keyOf(scope.entryId, model);
@@ -179,8 +185,9 @@ export class TicketStore {
     // An incomplete response or a missing value carries no candidate, and no contradiction either.
     if (!observation.completed || observation.value === undefined) return miss("ticket_no_candidate");
     if (observation.model === null) return miss("ticket_model_unknown");
-    // Positive contradiction: the upstream named a different model than the one requested.
-    if (observation.model !== model) return record("revoked", "ticket_model_mismatch", 0);
+    // Positive contradiction: the upstream named a different model than the one requested. Only
+    // a contradiction under the configured policy is revocation evidence.
+    if (observation.model !== model && !config.mismatch_is_success) return record("revoked", "ticket_model_mismatch", 0);
     const candidate = targetCandidate(observation.value, observation.model, model, config, ttlSeconds, now);
     if (!candidate)
       return miss(existing && existing.state !== "pending" ? "ticket_revalidation_required" : "ticket_target_mismatch", "ticket_target_mismatch");

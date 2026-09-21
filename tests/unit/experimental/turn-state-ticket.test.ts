@@ -24,7 +24,7 @@ import { CodexApi } from "@src/proxy/codex-api.js";
 import { WsConnectionPool } from "@src/proxy/ws-pool.js";
 import { TurnStateRuntime, turnStateRuntime as runtime, type ProbeResult, type Scope } from "@src/experimental/turn-state/runtime.js";
 import { ticketStore, paddedLength } from "@src/experimental/turn-state/ticket-store.js";
-import { classifyState, TicketConfigSchema, TurnStateConfigSchema } from "@src/experimental/turn-state/policy.js";
+import { classifyState, TurnStateConfigSchema } from "@src/experimental/turn-state/policy.js";
 import { scopeIdentity } from "@src/experimental/turn-state/protocol.js";
 import type { TlsTransport } from "@src/tls/transport.js";
 
@@ -37,7 +37,8 @@ const base = "https://chatgpt.com/backend-api";
 const ticketNow = () => Math.floor((Date.now() - 60_000) / 1000) * 1000;
 type Egress = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
 type Candidate = (scope: Scope, value: string, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
-const ticketConfig = TicketConfigSchema.parse({ enabled: true, harvest_proxy_url: "http://harvest:8080" });
+/** The candidate policy the store judges against; mirrors the experiment config the runtime passes. */
+const ticketConfig = TurnStateConfigSchema.parse({ active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
 /**
  * A personal envelope is 57 + 16*10 = 217 bytes → 290 unpadded base64url chars, or 292 with
  * the two padding characters the upstream may include. The alphabet stays base64url in both
@@ -73,8 +74,9 @@ beforeEach(() => {
   scope = { entryId: `entry-${++seq}`, model: "model", ...scopeIdentity("credential", null, base, null), routeId: "route", label: null, plan: "personal", provenance: "account" };
   binding = `${scope.identity}|${scope.credential}|${scope.routeId}`;
   resolveScope = (entryId, model) => ({ ...scope, entryId, model });
-  runtime.update({ enabled: true, mode: "observe", passive_enabled: true, active_enabled: false,
-    ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+  // `always` so the collection layer actually supplies values; `mode` gates injection for both
+  // layers, and observe deliberately collects without ever injecting.
+  runtime.update({ enabled: true, mode: "always", passive_enabled: true, active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
   runtime.start((entryId, model) => resolveScope(entryId, model), async () => ({ completed: false }));
   runtime.startTicket(harvestOf(envelope()), confirms);
 });
@@ -191,10 +193,15 @@ describe("C. revalidation: one 312 is not a revocation", () => {
     expect(await miss()).toBe("ticket_revalidation_required");
     expect(await miss()).toBe("ticket_target_mismatch");
   });
-  it("never harvests without a dedicated harvest proxy URL", async () => {
-    runtime.update({ ...runtime.config, ticket: { enabled: true, harvest_proxy_url: null } });
-    expect(await harvest()).toBe("harvest_proxy_missing");
-    expect(ticketStore.get(scope.entryId, scope.model)).toBeUndefined();
+  it("collects over the business route when no dedicated proxy is set", async () => {
+    // Contract: an unset proxy must still collect — it falls back to the account's own route
+    // rather than dead-ending, so the feature works without extra infrastructure.
+    const calls: unknown[] = [];
+    runtime.update({ ...runtime.config, active_enabled: true, harvest_proxy_url: null });
+    runtime.startTicket((scope, signal, reserve) => { calls.push("business"); return harvestOf(envelope())(scope, signal, reserve); }, confirms);
+    expect(await harvest()).toBe("ticket_verified");
+    expect(calls).toEqual(["business"]);
+    expect(ticketStore.get(scope.entryId, scope.model)?.state).toBe("verified");
   });
 });
 
@@ -233,6 +240,10 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
   it("injects the verified ticket on HTTP and on a new WS handshake, never on a reused socket", async () => {
     const ticket = envelope();
     await verify(ticket);
+    // Passive capture off for this case: with it on, a state carried by the response would be
+    // observed and legitimately win the header (the generic snapshot takes precedence), which
+    // would make this assertion about the wrong layer.
+    runtime.update({ ...runtime.config, passive_enabled: false });
     const post = vi.fn().mockImplementation(async () => http(complete("model"), envelope(ticketNow() + 1000)));
     const a = api(post);
     await drain(a, await a.createResponse({ ...request }));
@@ -261,7 +272,7 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
     } finally { pool.shutdown(); }
   });
   it("fail-closed rejects a fresh applicable dispatch before it is sent", async () => {
-    runtime.update({ enabled: true, mode: "always", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080", fallback: "closed" } });
+    runtime.update({ enabled: true, mode: "always", active_enabled: true, harvest_proxy_url: "http://harvest:8080", fallback: "strict" });
     const post = vi.fn().mockImplementation(async () => http(complete("model")));
     await expect(api(post).createResponse({ ...request })).rejects.toThrow("ticket_unverified");
     expect(post).not.toHaveBeenCalled();
@@ -273,7 +284,7 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
     expect(post.mock.calls[0][1]["x-codex-turn-state"]).toBe(native);
   });
   it("fail-open keeps dispatching without a ticket", async () => {
-    runtime.update({ enabled: true, mode: "always", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    runtime.update({ enabled: true, mode: "always", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     const post = vi.fn().mockImplementation(async () => http(complete("model")));
     await drain(api(post), await api(post).createResponse({ ...request }));
     expect(post).toHaveBeenCalledOnce();
@@ -284,7 +295,7 @@ describe("F/G. dispatch: fail-open, fail-closed, HTTP and new WS only", () => {
   it("rejects at true dispatch time when the credential rotated after selection", async () => {
     await verify();
     // Fail-closed only refuses a dispatch that must carry a state, so make this one applicable.
-    runtime.update({ ...runtime.config, mode: "always", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080", fallback: "closed" } });
+    runtime.update({ ...runtime.config, mode: "always", active_enabled: true, harvest_proxy_url: "http://harvest:8080", fallback: "strict" });
     const post = vi.fn().mockImplementation(async () => http(complete("model")));
     // The credential rotates after the scope is resolved but before the transport is wired.
     const original = resolveScope;
@@ -341,7 +352,7 @@ describe("H. the harvest/business-route transport seam", () => {
     fake.post.mockImplementation(async (_url: string, headers: Record<string, string>) =>
       sse("model", headers["x-codex-turn-state"] ?? envelope()));
     fake.config = { api: { base_url: base }, client: { app_version: "test" }, auth: { request_interval_ms: 0 },
-      experimental_turn_state: { enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } } } as typeof fake.config;
+      experimental_turn_state: { enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" } } as typeof fake.config;
     const entry = { id: scope.entryId, token: "credential", accountId: null, status: "active", planType: "plus", label: "test" };
     const pool = { getEntry: () => entry, getAllEntries: () => [entry], acquire: () => ({ ...entry, entryId: entry.id, prevSlotMs: null }), releaseWithoutCounting: vi.fn(), updateCachedQuota: vi.fn(), applyRateLimit429: vi.fn() };
     const routes = { getAssignment: () => "direct", resolveProxyUrl: () => null };
@@ -349,7 +360,7 @@ describe("H. the harvest/business-route transport seam", () => {
     runtime.shutdown();
     fake.post.mockClear();
     startTurnState(pool as never, { getCookieHeader: () => "" } as never, routes as never);
-    runtime.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    runtime.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     expect(await harvest()).toBe("ticket_verified");
     expect(fake.post).toHaveBeenCalledTimes(2);
     // The synthetic harvest leaves through the dedicated proxy and carries no state.
@@ -359,24 +370,35 @@ describe("H. the harvest/business-route transport seam", () => {
     expect(fake.post.mock.calls[1][5]).toBeNull();
     expect(fake.post.mock.calls[1][1]["x-codex-turn-state"]).toBe(envelope());
   });
-  it("never harvests when the dedicated proxy is unset, even though ticket mode is on", async () => {
+  it("collects over the business route when the dedicated proxy is unset", async () => {
     const entry = { id: scope.entryId, token: "credential", accountId: null, status: "active", planType: "plus", label: "test" };
     const pool = { getEntry: () => entry, getAllEntries: () => [entry], acquire: () => ({ ...entry, entryId: entry.id, prevSlotMs: null }), releaseWithoutCounting: vi.fn(), updateCachedQuota: vi.fn(), applyRateLimit429: vi.fn() };
-    const routes = { getAssignment: () => "auto", resolveProxyUrl: vi.fn(() => null) };
+    const routes = { getAssignment: () => "direct", resolveProxyUrl: vi.fn(() => null) };
     const { startTurnState } = await import("@src/experimental/turn-state/integration.js");
+    // The integration reads the live config, which an earlier case may have pointed at a
+    // dedicated proxy; unset it so this case actually exercises the fallback path.
+    fake.config = { api: { base_url: base }, client: { app_version: "test" }, auth: { request_interval_ms: 0 } } as typeof fake.config;
     runtime.shutdown();
+    fake.post.mockReset();
+    fake.post.mockImplementation(async (_url: string, headers: Record<string, string>) => ({ status: 200,
+      headers: new Headers({ "x-codex-turn-state": envelope() }),
+      body: new Response(new TextEncoder().encode(complete("model"))).body!, setCookieHeaders: [] }));
     startTurnState(pool as never, { getCookieHeader: () => "" } as never, routes as never);
-    runtime.update({ ...runtime.config, ticket: { enabled: true, harvest_proxy_url: null } });
-    expect(await harvest()).toBe("harvest_proxy_missing");
-    expect(fake.post).not.toHaveBeenCalled();
-    // The harvest requirement never routes through the account's round-robin selector.
-    expect(routes.resolveProxyUrl).not.toHaveBeenCalled();
+    // startTurnState seeds the runtime from the live config, so re-assert the case's own state.
+    runtime.update({ ...runtime.config, enabled: true, mode: "always", active_enabled: true, harvest_proxy_url: null });
+    // Without a dedicated egress both passes use the business route: collection and verification.
+    expect(await harvest()).toBe("ticket_verified");
+    expect(fake.post).toHaveBeenCalledTimes(2);
+    // Both passes leave through the account's own route, and the second re-dispatches the
+    // candidate it just collected so verification still happens without a dedicated proxy.
+    for (const call of fake.post.mock.calls) expect(call[5]).toBeNull();
+    expect(fake.post.mock.calls[1][1]["x-codex-turn-state"]).toBe(envelope());
   });
 });
 
 describe("J. generic mode stays unchanged", () => {
   it("does nothing at all while ticket mode is disabled", async () => {
-    runtime.update({ enabled: true, mode: "observe", ticket: { enabled: false } });
+    runtime.update({ enabled: true, mode: "observe", active_enabled: false });
     const post = vi.fn().mockImplementation(async () => http(complete("model")));
     await drain(api(post), await api(post).createResponse({ ...request, turnState: "native" } as typeof request));
     expect(post.mock.calls[0][1]["x-codex-turn-state"]).toBe("native");
@@ -386,42 +408,42 @@ describe("J. generic mode stays unchanged", () => {
     expect(runtime.overview().summary.ticket_unverified).toBe(0);
   });
   it("leaves the generic snapshot in charge when no ticket is verified", async () => {
-    runtime.update({ enabled: true, mode: "always", passive_enabled: true, active_enabled: true, ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    runtime.update({ enabled: true, mode: "always", passive_enabled: true, active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     const generic = envelope(undefined, 10, 2);
     runtime.start((entryId, model) => resolveScope(entryId, model), async (_s, _a, reserve) => ({ completed: reserve(), value: generic, model: "model" }));
     expect(await runtime.probe(scope.entryId, scope.model)).toBe("accepted");
+    const before = runtime.overview().summary.injection_count;
+    const ticketBefore = runtime.overview().summary.ticket_injected;
     const post = vi.fn().mockImplementation(async () => http(complete("model")));
     await drain(api(post), await api(post).createResponse({ ...request }));
     expect(post.mock.calls[0][1]["x-codex-turn-state"]).toBe(generic);
-    expect(runtime.overview().summary.injection_count).toBe(1);
-    expect(runtime.overview().summary.ticket_injected).toBe(0);
+    // Delta, not absolute: the shared runtime's counters span every case in this file.
+    expect(runtime.overview().summary.injection_count - before).toBe(1);
+    expect(runtime.overview().summary.ticket_injected - ticketBefore).toBe(0);
     // Ticket mode never turns a business observation into a ticket.
     expect(runtime.overview().tickets).toEqual([]);
   });
 });
 
 describe("K. configuration stays backward compatible and default-off", () => {
-  it("parses a config saved before ticket mode existed, with ticket mode off", () => {
+  it("parses a config that predates the flat schema, with collection off", () => {
     // Every existing runtime.update({...}) call posts a partial object; a new required key
-    // would break all of them, and a saved config must never enable ticket mode implicitly.
+    // would break all of them, and a saved config must never start collecting implicitly.
     const legacy = TurnStateConfigSchema.parse({ enabled: true, mode: "always", passive_enabled: true, active_enabled: true });
-    expect(legacy.ticket).toEqual({ enabled: false, target_length: 292, harvest_proxy_url: null, fallback: "open", revoke_after_signals: 2 });
-    expect(TurnStateConfigSchema.parse({}).ticket.enabled).toBe(false);
-    expect(TurnStateConfigSchema.parse({ ticket: { enabled: true } }).ticket)
-      .toMatchObject({ enabled: true, target_length: 292, fallback: "open", harvest_proxy_url: null });
+    expect(legacy).toMatchObject({ active_enabled: true, harvest_proxy_url: null, revalidate: true, mismatch_is_success: false, revoke_after_signals: 2 });
+    expect(TurnStateConfigSchema.parse({})).toMatchObject({ active_enabled: false, enabled: false, revalidate: true, mismatch_is_success: false });
   });
   it("rejects an unusable harvest proxy rather than silently falling back to business egress", () => {
     // Path/query/fragment or a non-proxy scheme would make the "dedicated egress" claim false.
     for (const bad of ["http://h:1/path", "http://h:1?x=1", "ftp://h:1", "not-a-url", ""])
-      expect(TurnStateConfigSchema.safeParse({ ticket: { harvest_proxy_url: bad } }).success).toBe(false);
+      expect(TurnStateConfigSchema.safeParse({ harvest_proxy_url: bad }).success).toBe(false);
     for (const good of [null, "http://h:8080", "https://user:pw@h:443", "socks5h://h:1080"])
-      expect(TurnStateConfigSchema.safeParse({ ticket: { harvest_proxy_url: good } }).success).toBe(true);
-    expect(TurnStateConfigSchema.safeParse({ ticket: { target_length: 291 } }).success).toBe(false);
-    expect(TurnStateConfigSchema.safeParse({ ticket: { nope: 1 } }).success).toBe(false);
+      expect(TurnStateConfigSchema.safeParse({ harvest_proxy_url: good }).success).toBe(true);
+    expect(TurnStateConfigSchema.safeParse({ nope: 1 }).success).toBe(false);
   });
   it("masks the harvest proxy credential in the overview", () => {
-    runtime.update({ ...runtime.config, ticket: { enabled: true, harvest_proxy_url: "https://user:secret@harvest:8443" } });
-    const config = runtime.overview().config.ticket;
+    runtime.update({ ...runtime.config, active_enabled: true, harvest_proxy_url: "https://user:secret@harvest:8443" });
+    const config = runtime.overview().config;
     expect(config.harvest_proxy_url).toContain("***");
     expect(JSON.stringify(runtime.overview())).not.toContain("secret");
   });
@@ -433,7 +455,7 @@ describe("I. bounded operation", () => {
     let now = t0;
     const r = new TurnStateRuntime(() => now);
     const sends = vi.fn(harvestOf(envelope(t0 + 3000)));
-    r.update({ enabled: true, mode: "observe", ticket: { enabled: true, harvest_proxy_url: "http://harvest:8080" } });
+    r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(sends, confirms);
     const observed = { value: envelope(t0), completed: true, model: "model" };

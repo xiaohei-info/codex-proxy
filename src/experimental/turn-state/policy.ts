@@ -15,38 +15,70 @@ export function validProxyUrl(value: string): boolean {
 }
 
 /**
- * Opt-in Verified 292 ticket layer, layered on the generic runtime.
- * `target_length` is the exact padded envelope length a ticket must have: a
- * personal envelope is 57 + 16*10 = 217 bytes, i.e. 292 padded base64 chars
- * (an 11-block envelope is 312 and is not a target). `harvest_proxy_url` is used
- * by the synthetic HTTP probe only and never by business dispatch.
+ * One flat configuration for the experiment. The three sections are orthogonal:
+ *
+ * - experiment: `enabled` / `mode` / `fallback` are the only things that decide whether a
+ *   state is injected, and what happens when none is available.
+ * - collection: `passive_enabled` / `active_enabled` / `harvest_proxy_url` / `revalidate`
+ *   only produce states; they never decide whether one is used.
+ * - rules: `mismatch_is_success` / `account_mode` / timing / `revoke_after_signals` judge
+ *   whether a produced candidate qualifies.
+ *
+ * There is deliberately no separate ticket configuration: an active collection round *is*
+ * the verified-ticket harvest, so a second switch could only ever disagree with this one.
  */
-export const TicketConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  target_length: z.number().int().min(73).max(2048).refine(v => v % 4 === 0, { message: "target_length must be a padded base64 length" }).default(292),
-  harvest_proxy_url: z.string().max(512).refine(validProxyUrl, { message: "harvest_proxy_url must be an http/https/socks5/socks5h origin without path, query or fragment" }).nullable().default(null),
-  /** `open` keeps dispatching without a verified ticket; `closed` rejects a fresh applicable dispatch. */
-  fallback: z.enum(["open", "closed"]).default("open"),
-  /** Consecutive upstream misses that revoke a verified ticket; one miss only marks it revalidating. */
-  revoke_after_signals: z.number().int().min(1).max(10).default(2),
-}).strict();
-export type TicketConfig = z.infer<typeof TicketConfigSchema>;
-
-export const TurnStateConfigSchema = z.object({
+export const TurnStateConfigFields = z.object({
+  // Experiment: the single injection decision.
   enabled: z.boolean().default(false),
   mode: z.enum(["off", "observe", "replace", "always"]).default("off"),
   fallback: z.enum(["passthrough", "strict"]).default("passthrough"),
+  // Collection: only produces states.
   passive_enabled: z.boolean().default(false),
   active_enabled: z.boolean().default(false),
+  /** Dedicated egress for collection. `null` collects over the account's own business route. */
+  harvest_proxy_url: z.string().max(512).refine(validProxyUrl, { message: "harvest_proxy_url must be an http/https/socks5/socks5h origin without path, query or fragment" }).nullable().default(null),
+  /** Re-dispatch a harvested candidate and require the upstream to accept it before trusting it. */
+  revalidate: z.boolean().default(true),
+  // Rules: judge a candidate.
+  /** A state whose upstream model differs from the requested one fails unless this is on. */
+  mismatch_is_success: z.boolean().default(false),
   account_mode: z.enum(["auto", "personal", "team"]).default("auto"),
   ttl_seconds: z.number().int().min(120).max(3600).default(3600),
   refresh_before_seconds: z.number().int().min(30).max(1800).default(1200),
   probe_timeout_seconds: z.number().int().min(1).max(60).default(20),
   cooldown_seconds: z.number().int().min(180).max(3600).default(180),
   max_attempts_per_round: z.number().int().min(1).max(2).default(2),
-  ticket: TicketConfigSchema.default({}),
+  /** Consecutive upstream misses that revoke a verified ticket; one miss only marks it revalidating. */
+  revoke_after_signals: z.number().int().min(1).max(10).default(2),
 }).strict().refine(c => c.refresh_before_seconds < c.ttl_seconds - 30, { message: "refresh must precede expiry safety margin" });
-export type TurnStateConfig = z.infer<typeof TurnStateConfigSchema>;
+
+/**
+ * Lift the retired nested `ticket` block onto the flat schema before validation.
+ *
+ * `experimental_turn_state` lives in the operator's own `data/local.yaml`, and the global
+ * `ConfigSchema.parse` aborts startup on any unknown key. Without this, upgrading while a
+ * `ticket` block is still on disk would take the whole proxy down rather than this one
+ * experiment, so the old shape is migrated instead of rejected.
+ *
+ * A key already present at the top level wins: the flat form is the current spelling, and a
+ * half-migrated file must not silently revert the operator's newer edit.
+ */
+export function flatTurnStateConfig(input: unknown): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  const { ticket, ...rest } = input as Record<string, unknown>;
+  if (typeof ticket !== "object" || ticket === null || Array.isArray(ticket)) return rest;
+  const legacy = ticket as Record<string, unknown>;
+  return {
+    ...rest,
+    // `ticket.enabled` was the collection switch, which is now `active_enabled`.
+    ...(rest.active_enabled === undefined && legacy.enabled !== undefined ? { active_enabled: legacy.enabled } : {}),
+    ...(rest.harvest_proxy_url === undefined && legacy.harvest_proxy_url !== undefined ? { harvest_proxy_url: legacy.harvest_proxy_url } : {}),
+    ...(rest.revoke_after_signals === undefined && legacy.revoke_after_signals !== undefined ? { revoke_after_signals: legacy.revoke_after_signals } : {}),
+  };
+}
+
+export const TurnStateConfigSchema = z.preprocess(flatTurnStateConfig, TurnStateConfigFields);
+export type TurnStateConfig = z.infer<typeof TurnStateConfigFields>;
 export type Plan = "personal" | "team";
 export const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 

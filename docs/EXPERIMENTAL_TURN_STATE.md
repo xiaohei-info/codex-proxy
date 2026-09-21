@@ -11,26 +11,32 @@ The saved effective mode is shown separately from unsaved edits. Save persists t
 `experimental_turn_state` section in local YAML. Dashboard ADMIN authentication and
 its existing localhost exception apply. Keeper is read-only and cannot change settings.
 
-- `enabled: false` or `mode: off`: no experimental observation, probing or injection.
-- `observe`: optionally collect successful business states, never mutate requests.
+- `enabled: false` or `mode: off`: no experimental collection or injection.
+- `observe`: collect state, never mutate requests. Collection result is stored but not used.
 - `replace`: replace an existing structurally incompatible client state only when a
-  usable matching cache exists. Missing or already-compatible client state is unchanged.
-- `always`: inject a usable matching cached state when available.
-- `fallback: passthrough` (default): cache misses leave requests unchanged.
-  `strict` rejects before an applicable fresh dispatch on a cache miss; it does not
+  usable collected state exists. Missing or already-compatible client state is unchanged.
+- `always`: use a usable collected state when available.
+- `fallback: passthrough` (default): a missing state leaves requests unchanged.
+  `strict` rejects a fresh dispatch that must carry one, before anything is sent; it does not
   reject observe/off, compaction or a reused WebSocket merely because no override applies.
-- `passive_enabled` independently enables capture after successful `response.completed`.
-- `active_enabled` separately opts into billable probes. The UI asks for cost confirmation
-  when saving active-enabled settings and for each manual probe.
+- `passive_enabled` independently enables collecting from successful `response.completed`.
+- `active_enabled` separately opts into billable collection requests. The UI asks for cost
+  confirmation when saving active-enabled settings and for each manual round.
+- `harvest_proxy_url` (default empty) selects a dedicated egress for collection only. Empty
+  collects over the account's own business route, so no extra infrastructure is required.
+- `revalidate: true` (default) re-dispatches a collected candidate the same way and only trusts
+  it once the upstream accepts it. Costs one extra request per round.
+- `mismatch_is_success: false` (default): a state whose served model differs from the requested
+  one is not trusted. On, the substitution is accepted and still recorded for observability.
 - `account_mode: auto` uses account plan metadata, **not token length**. Unknown plans
   assume personal and expose `assumed_personal` provenance. Use personal/team override
   only if appropriate. Changing configuration cancels experimental tasks and clears cache.
 
-The UI accepts explicit account entry ID and actual upstream model, or selects a known
-session. **probe** runs one bounded round; **clear** discards that scope's cache;
-**Pause this account/model experiment** (`stop`) pauses all experimental capture, injection
-and probing for that scope. Only the explicit **Resume** action unpauses it: clear, business
-traffic, configuration toggles and manual probes cannot resume it. Native caller-state
+The UI accepts an explicit account entry ID and actual upstream model, or selects a known
+session. **Collect now** runs one bounded round; **clear** discards that scope's cache;
+**Pause this account/model experiment** (`stop`) pauses all experimental collection and
+injection for that scope. Only the explicit **Resume** action unpauses it: clear, business
+traffic, configuration toggles and manual rounds cannot resume it. Native caller-state
 passthrough and business traffic continue, with no experimental strict rejection.
 Clear/pause/resume cancel only scoped experimental publishers, preserving unrelated scopes
 and all billing/auth guards. Paused scopes remain RAM-only until resume or process restart. Business response snapshots already selected
@@ -38,12 +44,12 @@ are immutable. Stopping experimental publication does not abort business output.
 
 ## Cost and safety limits
 
-Active probes use a short independent HTTP request with no user history, prior response
-ID or prior state. They lease the exact account through the existing account pool, reuse
-its TLS/auth and actual business egress, and release without counting as normal user usage.
+Active collection uses a short independent HTTP request with no user history, prior response
+ID or prior state. It leases the exact account through the existing account pool, reuses
+its TLS/auth and actual business egress, and releases without counting as normal user usage.
 There is no independent/random egress scheduler, quota bypass or model-family hardcode.
 **Auto round-robin assignments are unsupported** (`auto_route_unsupported`): no experiment,
-strict rejection or probe lease occurs. Native business routing is unchanged. Status reads
+strict rejection or collection lease occurs. Native business routing is unchanged. Status reads
 never advance the round-robin cursor. Use fixed/global/direct egress for this slice.
 
 - Global concurrency: 2; per account/model singleflight.
@@ -52,7 +58,7 @@ never advance the round-robin cursor. Use fixed/global/direct egress for this sl
 - Hard cap: **6 actual dispatches per account entry per rolling hour**, across models,
   routes and credential refresh. Config toggles, clear and business activity do not reset it.
 - Background eligibility: 30 minutes since actual business dispatch, only observed scopes;
-  probes themselves do not refresh it. A manual probe gives one round, not a new activity window.
+  rounds themselves do not refresh it. A manual round gives one round, not a new activity window.
 - Auth errors block the credential across models until its identity changes. Quota errors
   block the account across models, honor Retry-After and update the normal quota protections.
 - Unknown usage stays null, **not zero**. Probes and known usage appear in active events.
@@ -60,9 +66,9 @@ never advance the round-robin cursor. Use fixed/global/direct egress for this sl
   Restart clears them; configuration persists. Restart therefore resets the hourly budget.
   Counters are since runtime epoch, not durable history. No encrypted state persistence exists.
 
-Sessions/events are each capped at 200. The 200-event cap is shared: ticket-layer events are
+Sessions/events are each capped at 200. The 200-event cap is shared: collection-layer events are
 merged with the generic ones and the snapshot emits only the newest 200. Capacity fails closed
-for probing rather than
+for collection rather than
 resetting retained billing guards. The integration snapshot contains only bounded whitelist
 metadata and short digests of **state**, never credential digests, complete states or prompts.
 
@@ -108,81 +114,93 @@ code strings, timestamp strings and state fingerprints; unknown valid codes rema
 Proxy-only mutation endpoints:
 
 - `POST /admin/turn-state/config`: complete validated configuration object.
-- `POST /admin/turn-state/action`: `{action: "probe"|"harvest"|"clear"|"stop"|"resume", entry_id, model, confirmed: true}`.
+- `POST /admin/turn-state/action`: `{action: "probe"|"clear"|"stop"|"resume", entry_id, model, confirmed: true}`.
 
-## Verified 292 ticket mode (opt-in, default off)
+The `probe` action is the manual "one collection round" trigger; `harvest` was folded into it when
+the separate ticket layer was removed.
 
-A separate decision layer over the same runtime. It is **not** the generic snapshot: it never
-reads or writes `active`/`ready`, and generic mode behaves identically whether it is on or off.
+## How a state is collected and trusted
+
+Collection is the producer; `mode` is the only consumer. A round behaves the same whether it runs
+on demand, on the background schedule, or as a refresh — there is deliberately no separate ticket
+sub-experiment, so no second switch can disagree with this one.
 
 ```yaml
 experimental_turn_state:
-  ticket:
-    enabled: false
-    target_length: 292        # a padded personal envelope; keep 4-aligned
-    harvest_proxy_url: null   # dedicated synthetic egress, masked in the overview
-    fallback: open            # open | closed
-    revoke_after_signals: 2   # consecutive misses before revoking a verified ticket
+  harvest_proxy_url: null   # dedicated collection egress; masked in the overview
+  revalidate: true          # re-dispatch the candidate before trusting it
+  revoke_after_signals: 2   # consecutive misses before discarding a saved state
+  mismatch_is_success: false # accept a state served under a different model
 ```
 
-A ticket must clear every stage, in order; a later stage never weakens an earlier one:
+A candidate must clear every stage, in order; a later stage never weakens an earlier one:
 
-1. **Harvest** (synthetic HTTP only) leaves through `harvest_proxy_url`. Unset means no harvest at
-   all — ticket mode never falls back to the account's business egress for harvesting.
-2. **Candidate** must be `classifyState`-valid *and* exactly `target_length` (290 unpadded and 292
-   padded are the same value). The response must have reached `response.completed` with a
-   `completed` status, and the upstream must have disclosed the **exact requested model**.
-3. **Revalidation** re-dispatches that candidate through the account's *current business route*,
-   same account and model, and requires the same completion and model evidence. Only this pass
-   can set `verified`; the dedicated proxy can never authorize injection by itself.
+1. **Collect** leaves through `harvest_proxy_url` when set, otherwise over the account's own
+   business route. An empty proxy is a supported configuration, not a dead end.
+2. **Candidate** must be `classifyState`-valid for a personal envelope (10 blocks). The response
+   must have reached `response.completed` with a `completed` status. The served model must match
+   the requested one unless `mismatch_is_success` is on.
+3. **Verify** (when `revalidate` is on) re-dispatches that candidate and requires the upstream to
+   return the same value before it is trusted. This proves the state is usable, not merely
+   well-formed, and it works for every combination of proxy and route — re-verification is about
+   the value's validity, not the egress's reputation. With `revalidate: false` a single collected
+   observation is trusted directly.
 
-**Binding.** A ticket is bound to entry, model, credential identity and business route identity.
-A credential refresh, base-URL change or route change makes it unusable (reported
-`ticket_revalidation_failed`) until it is re-harvested. Injection happens at true dispatch time,
-not at selection time, so a rotation between the two cannot ship a stale ticket.
+**Binding.** A saved state is bound to entry, model, credential identity and business route
+identity. A credential refresh, base-URL change or route change makes it unusable (reported
+`ticket_revalidation_failed`) until it is collected again. Use happens at true dispatch time, not
+at selection time, so a rotation between the two cannot ship a stale value.
 
 **Injection.** HTTP and **new WebSocket handshakes** only. A reused pooled socket skips override
 and reports `ws_connection_reused`; its handshake and `previous_response_id` continuity are intact.
 A WS→HTTP fallback counts one injection, not two. The generic snapshot still wins when it has a
-value; a ticket is a stricter source for the same header, never a competing one.
+value; a collected state is a stricter source for the same header, never a competing one.
 
-**Fail-open/fail-closed.** `open` dispatches without a ticket. `closed` rejects a fresh dispatch
-that would otherwise need one — before anything is sent — and leaves a request that already carries
-a structurally valid state of its own untouched. Applicability is ticket-mode's own decision; the
-generic `mode`/`fallback` knobs are unaffected.
+**Fail-open/fail-closed.** `passthrough` sends the request without a state. `strict` rejects a
+fresh dispatch that would otherwise need one — before anything is sent — and leaves a request that
+already carries a structurally valid state of its own untouched.
 
-**312 is a signal, not a revocation.** One non-target (or missing-model, or incomplete) observation
-marks a verified ticket `revalidating`: the value is kept, its usability is withdrawn, and a
-re-harvest is scheduled at the cooldown cadence. Revocation needs `revoke_after_signals`
-consecutive misses, or a confirmed contradiction (the upstream named a different model). Verified
-tickets are refreshed ahead of expiry by `refresh_before_seconds`.
+**One miss is not a revocation.** A single non-conforming observation (an 11-block envelope, a
+missing model, an incomplete response) only marks a trusted state `revalidating`: the value is
+kept, its usability is withdrawn, and a refresh is scheduled at the cooldown cadence. Discarding
+needs `revoke_after_signals` consecutive misses, or a confirmed contradiction (the upstream named
+a different model while `mismatch_is_success` is off). Trusted states are refreshed ahead of
+expiry by `refresh_before_seconds`.
 
 **Bounds.** One round per account/model at a time, global concurrency 2, `probe_timeout_seconds`
 timeout, and abort on pause, `clear`, shutdown or any config change. Rounds are keyed per scope, so
 pausing one scope cancels only its own round.
 
-**Master switch.** Ticket mode is a sub-switch of this experiment, not a second experiment. With
-`enabled: false` (or `mode: off`) it neither harvests, injects, refreshes, nor accepts a manual
-`harvest` action: `harvest` returns `disabled` and a business dispatch is governed by the generic
-layer alone. `mode` and `fallback` remain generic knobs that ticket mode does not read.
+**Master switch.** Collection is part of this experiment, not a second one. With `enabled: false`
+(or `mode: off`) it neither collects, uses, refreshes, nor accepts a manual round: the call returns
+`disabled` and a business dispatch is governed by the generic layer alone. `mode` alone decides
+whether a collected state is used, so `observe` deliberately collects without injecting.
 
-**Shared budget.** Every ticket round that reaches the network spends the same hard
-6-dispatches-per-account-per-rolling-hour budget as active probing — each harvest and each
-business-route revalidation is one real upstream request. Exhausting it reports
-`budget_exhausted`; no config change, `clear` or `resume` resets it. Harvest leaves through the
-dedicated proxy, so its rate limits are never attributed to the account's business route;
-revalidation does use the business route, so it also honors the account-level auth/quota guards.
+**Shared budget.** Every round that reaches the network spends the same hard
+6-dispatches-per-account-per-rolling-hour budget as the generic probe path — each collection and
+each verification pass is one real upstream request. Exhausting it reports `budget_exhausted`; no
+config change, `clear` or `resume` resets it. A dedicated `harvest_proxy_url` keeps its rate limits
+from being attributed to the account's business route; verification always uses the business route,
+so it also honors the account-level auth/quota guards.
 
-**Storage and exposure.** Tickets are the one persisted piece of this experiment:
+**Storage and exposure.** Collected states are the one persisted piece of this experiment:
 `<dataDir>/codex-tickets.json`, written atomically (tmp + rename) with mode `0600`, pruned and
 capped. The raw value never leaves the store: the overview exposes a length, fingerprint, state,
 reason and timestamps only, and the masked `harvest_proxy_url` round-trips through the UI without
-exposing or losing its credential. Raw streamed bytes are withheld from debug dumps while ticket
-mode is active, because a state can span arbitrary chunk boundaries.
+exposing or losing its credential. Raw streamed bytes are withheld from debug dumps while active
+collection is on, because a state can span arbitrary chunk boundaries.
 
-**Observe first.** Defaults are `enabled: false` and `fallback: open`. Enable harvest and
-verification first, confirm real 292 yield, business-route revalidation success, model-match rate,
-ticket lifetime and 312 frequency, and only then consider `fallback: closed`.
+**Observe first.** Defaults are `enabled: false`, `revalidate: true` and `mismatch_is_success:
+false`. Collect first, confirm real yield, verification success, model-match rate and state
+lifetime, and only then consider `mode: always` with `fallback: strict`.
+
+**Upgrading from the earlier nested form.** A `ticket:` block left in `data/local.yaml` is
+migrated rather than rejected: `ticket.enabled` becomes `active_enabled`, and
+`ticket.harvest_proxy_url` / `ticket.revoke_after_signals` move to the top level. A key already
+present at the top level wins, so a half-migrated file never reverts a newer edit. This matters
+because the whole config is validated at startup, so rejecting the key would take the proxy down
+instead of just this experiment. `target_length` and `ticket.fallback` are dropped: the former
+was already implied by the personal block count, and the latter is now just `fallback`.
 
 To roll back operationally, save `enabled: false` (and optionally `active_enabled: false`,
 `mode: off`). In-flight probes and ticket rounds are aborted and cannot publish. Restart is not
