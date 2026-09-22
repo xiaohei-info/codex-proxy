@@ -84,6 +84,19 @@ existing pooled socket cannot change handshake headers: it skips override, repor
 `previous_response_id` continuity remain intact; there is no experimental rekey/replay or
 forced HTTP fallback. HTTP probes are independent of this limitation.
 
+Because of that limitation the main request path defaults to **HTTP/SSE**
+(`prefer_http_transport: true`), where the full header set is sent on every request and a newly
+collected state therefore always reaches the wire. WebSocket is still used where it is required,
+never overridden by this setting:
+
+- a request that carries an explicit `previous_response_id` (the upstream HTTP path drops the id,
+  so honouring the HTTP preference there would silently discard the conversation context), and
+- a client that reached the proxy over WebSocket (`/v1/responses` upgrades), whose whole contract
+  is multi-turn continuation and whose upstream response-owner chain only exists on a pooled
+  socket.
+
+Set `prefer_http_transport: false` to restore the previous always-WebSocket behaviour.
+
 HTTP response headers and `codex.response.metadata.headers` are staged, then published
 only at successful terminal completion. A reused socket's original upgrade headers are
 ignored; current response body metadata still counts. Abort, early consumer return,
@@ -131,6 +144,7 @@ experimental_turn_state:
   revalidate: true          # re-dispatch the candidate before trusting it
   revoke_after_signals: 2   # consecutive misses before discarding a saved state
   mismatch_is_success: false # accept a state served under a different model
+  prefer_http_transport: true # send the main path over HTTP/SSE (see "Transport")
 ```
 
 A candidate must clear every stage, in order; a later stage never weakens an earlier one:
@@ -154,7 +168,9 @@ at selection time, so a rotation between the two cannot ship a stale value.
 **Injection.** HTTP and **new WebSocket handshakes** only. A reused pooled socket skips override
 and reports `ws_connection_reused`; its handshake and `previous_response_id` continuity are intact.
 A WS→HTTP fallback counts one injection, not two. The generic snapshot still wins when it has a
-value; a collected state is a stricter source for the same header, never a competing one.
+value; a collected state is a stricter source for the same header, never a competing one. Since
+`prefer_http_transport` defaults to HTTP, the main path normally carries the header on every
+request; WebSocket keeps the old skip-on-reuse behaviour for the continuations that need it.
 
 **Fail-open/fail-closed.** `passthrough` sends the request without a state. `strict` rejects a
 fresh dispatch that would otherwise need one — before anything is sent — and leaves a request that

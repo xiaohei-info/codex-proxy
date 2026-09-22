@@ -55,6 +55,7 @@ export function TurnStateSettings() {
     enabled: t("turnStateEnabled"), mode: t("turnStateMode"), fallback: t("turnStateFallback"),
     passive_enabled: t("turnStatePassive"), active_enabled: t("turnStateActive"),
     harvest_proxy_url: t("turnStateHarvestProxy"), revalidate: t("turnStateRevalidate"),
+    prefer_http_transport: t("turnStatePreferHttp"),
     mismatch_is_success: t("turnStateMismatchSuccess"), account_mode: t("turnStateAccountPlan"),
     ttl_seconds: t("turnStateTtl"), refresh_before_seconds: t("turnStateRefreshWindow"),
     probe_timeout_seconds: t("turnStateProbeTimeout"), cooldown_seconds: t("turnStateCooldown"),
@@ -68,7 +69,7 @@ export function TurnStateSettings() {
   const inputCls = "w-full max-w-[180px] px-3 py-2 bg-white dark:bg-bg-dark border border-gray-200 dark:border-border-dark rounded-lg text-xs text-slate-700 dark:text-text-main outline-none focus:ring-1 focus:ring-primary";
   const timingHints: Record<string, Parameters<typeof t>[0]> = { ttl_seconds: "turnStateTtl", refresh_before_seconds: "turnStateRefreshWindow", probe_timeout_seconds: "turnStateProbeTimeout", cooldown_seconds: "turnStateCooldown", max_attempts_per_round: "turnStateAttempts", revoke_after_signals: "turnStateRevokeSignalsHint" };
   const update = (key: string, value: unknown) => setConfig((current) => current ? { ...current, [key]: value } : current);
-  const toggle = (key: "passive_enabled" | "active_enabled" | "revalidate" | "mismatch_is_success", hint: Parameters<typeof t>[0]) =>
+  const toggle = (key: "passive_enabled" | "active_enabled" | "revalidate" | "prefer_http_transport" | "mismatch_is_success", hint: Parameters<typeof t>[0]) =>
     <SettingItemControl label={fieldLabels[key]} hint={t(hint)} saving={busy} saved={false} isDirty={false} requiresRestart={false}>
       <input type="checkbox" checked={config?.[key] ?? false} disabled={busy} onChange={e => update(key, e.currentTarget.checked)} class="w-4 h-4 rounded border-gray-300 dark:border-border-dark text-primary focus:ring-primary cursor-pointer" />
     </SettingItemControl>;
@@ -94,6 +95,7 @@ export function TurnStateSettings() {
         <p class="text-xs text-slate-500 dark:text-text-dim py-2">{t("turnStateCollectionSection")}</p>
         {toggle("passive_enabled", "turnStatePassiveHint")}
         {toggle("active_enabled", "turnStateActiveHint")}
+        {toggle("prefer_http_transport", "turnStatePreferHttpHint")}
         <SettingItemControl label={fieldLabels.harvest_proxy_url} hint={t("turnStateHarvestProxyHint")} saving={busy} saved={false} isDirty={false} requiresRestart={false}>
           <input class={inputCls} type="text" maxLength={512} placeholder="http://host:port" value={config.harvest_proxy_url ?? ""} disabled={busy} onInput={e => update("harvest_proxy_url", e.currentTarget.value || null)} />
         </SettingItemControl>

@@ -39,6 +39,16 @@ export const TurnStateConfigFields = z.object({
   harvest_proxy_url: z.string().max(512).refine(validProxyUrl, { message: "harvest_proxy_url must be an http/https/socks5/socks5h origin without path, query or fragment" }).nullable().default(null),
   /** Re-dispatch a harvested candidate and require the upstream to accept it before trusting it. */
   revalidate: z.boolean().default(true),
+  /**
+   * Prefer HTTP/SSE over WebSocket for the main request path.
+   *
+   * The state is an HTTP header, so a WebSocket can only carry it on its handshake: once the
+   * pool reuses a socket, a newly collected state cannot reach the request. HTTP sends the full
+   * header set every time, which is what makes injection work on every request.
+   *
+   * WebSocket is still used by the connection-owner paths that require it (implicit resume).
+   */
+  prefer_http_transport: z.boolean().default(true),
   // Rules: judge a candidate.
   /** A state whose upstream model differs from the requested one fails unless this is on. */
   mismatch_is_success: z.boolean().default(false),

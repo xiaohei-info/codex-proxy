@@ -38,6 +38,10 @@ import { PASSTHROUGH_FORMAT } from "./responses-passthrough.js";
 import { handleCompact } from "./responses-compact.js";
 import { handleCodexAuxiliaryJson } from "./codex-auxiliary.js";
 import {
+  CODEX_DOWNSTREAM_WS_HEADER,
+  clientReachedUsOverWebSocket,
+} from "./shared/codex-downstream-transport.js";
+import {
   supportsCodexAuxiliaryJson,
   type CodexAuxiliaryJsonPath,
 } from "../proxy/upstream-adapter.js";
@@ -175,7 +179,20 @@ export function createResponsesRoutes(
       store: false,
     };
 
-    codexRequest.useWebSocket = true;
+    // HTTP/SSE by default: the turn-state header can only ride a WebSocket handshake, so a
+    // pooled reuse would silently drop a newly collected state. HTTP sends the full header set
+    // on every request. WebSocket remains available via the setting, and is still used by the
+    // implicit-resume paths that need a response-owner chain.
+    // An absent section reads as the schema default (`true`), so a partial config behaves the
+    // same as an unset one instead of throwing.
+    //
+    // A client that reached us over WebSocket keeps the WebSocket upstream: that endpoint's
+    // whole contract is `previous_response_id` multi-turn (each frame re-enters this route), and
+    // the upstream response-owner chain it needs only exists on a pooled WS. Sending those frames
+    // over HTTP would drop the id silently and lose the conversation context.
+    // The id is assigned below, so the decision is completed there.
+    const preferHttp = config.experimental_turn_state?.prefer_http_transport ?? true;
+    codexRequest.useWebSocket = !preferHttp || clientReachedUsOverWebSocket(c);
     const forcedReview = c.req.path === "/v1/responses/review" || c.req.path === "/responses/review";
     const openAiSubagent =
       forcedReview
@@ -190,6 +207,9 @@ export function createResponsesRoutes(
     }
     if (typeof body.previous_response_id === "string") {
       codexRequest.previous_response_id = body.previous_response_id;
+      // An explicit continuation must go upstream over WebSocket: the HTTP path drops the id, so
+      // honouring the HTTP preference here would silently discard the conversation context.
+      if (codexRequest.previous_response_id) codexRequest.useWebSocket = true;
     }
     if (typeof body.prompt_cache_key === "string") {
       codexRequest.prompt_cache_key = body.prompt_cache_key;

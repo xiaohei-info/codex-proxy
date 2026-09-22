@@ -27,6 +27,7 @@ import type { AccountPool } from "../auth/account-pool.js";
 import type { ClientKeyPool } from "../auth/client-key-pool.js";
 import { getConfig } from "../config.js";
 import { parseSSEStream } from "../proxy/codex-sse.js";
+import { CODEX_DOWNSTREAM_WS_HEADER } from "./shared/codex-downstream-transport.js";
 
 /** The only path this server accepts upgrades for. */
 const UPGRADE_PATH = "/v1/responses";
@@ -294,6 +295,9 @@ export class ResponsesWebSocketServer {
         headers[key.toLowerCase()] = value;
       }
     }
+    // Tell the route this frame came in over WebSocket. Its multi-turn contract only holds when
+    // the upstream leg does too, and the operator's HTTP preference must not override that.
+    headers[CODEX_DOWNSTREAM_WS_HEADER] = "1";
 
     let response: Response;
     try {

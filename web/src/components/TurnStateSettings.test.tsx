@@ -20,7 +20,8 @@ it("requires billing confirmation, posts full config and confines actions to sel
   const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   render(<I18nProvider><TurnStateSettings /></I18nProvider>);
   await screen.findByText("Collect actively");
-  // Checkbox order: [enabled, passive, active, revalidate, mismatch_is_success].
+  // Checkbox order: [enabled, passive, active, prefer_http_transport, revalidate, mismatch_is_success].
+  // "Collect actively" is the billing-relevant one, so the confirm gate is exercised here.
   fireEvent.click(screen.getAllByRole("checkbox")[2]);
   fireEvent.click(screen.getByText("Save configuration"));
   expect(confirm).toHaveBeenCalledOnce();
@@ -56,7 +57,8 @@ it("posts a config the backend schema accepts", async () => {
   render(<I18nProvider><TurnStateSettings /></I18nProvider>);
   await screen.findByText("Save configuration");
   // Editing any field is what merges the whole live config into the payload.
-  fireEvent.click(screen.getAllByRole("checkbox")[4]);
+  // Checkbox order: [enabled, passive, active, prefer_http_transport, revalidate, mismatch_is_success].
+  fireEvent.click(screen.getAllByRole("checkbox")[5]);
   fireEvent.click(screen.getByText("Save configuration"));
   await waitFor(() => expect(Object.keys(posted)).not.toHaveLength(0));
   const parsed = TurnStateConfigSchema.safeParse(posted);

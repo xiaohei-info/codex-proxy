@@ -211,7 +211,10 @@ export function createMessagesRoutes(
       requestId,
     });
     if (!allowUnauthenticated) {
-      codexRequest.useWebSocket = true;
+      // Same rule as /v1/responses: prefer HTTP/SSE so the turn-state header is present on every
+      // request rather than only on a WebSocket handshake. An absent section reads as the schema
+      // default (`true`), so a partial config behaves the same as an unset one.
+      codexRequest.useWebSocket = !(getConfig().experimental_turn_state?.prefer_http_transport ?? true);
     }
     if (defaultTools.length > 0) {
       codexRequest.tools = mergeDefaultTools(codexRequest.tools, defaultTools);
