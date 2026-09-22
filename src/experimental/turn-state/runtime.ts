@@ -53,6 +53,11 @@ interface Session {
   injectionCount: number; observationCount: number; probeCount: number; reusedCount: number;
   /** Active-collection rounds (ticket path) this scope has run; persisted like the others. */
   ticketRoundCount: number;
+  /**
+   * The passive split of `observationCount`, so a reader never has to subtract against a
+   * different source's window. `passiveAccepted + passiveRejected === observationCount`.
+   */
+  passiveAccepted: number; passiveRejected: number;
   diagnostic: string | null; lastObserved: number | null; lastInjected: number | null;
   /** Real upstream model the last observation reported, and whether it differed from the request. */
   lastUpstreamModel: string | null; modelMismatch: boolean;
@@ -126,11 +131,13 @@ type SummaryCounter = "injection_count" | "passive_observations" | "passive_acce
   | "active_probes" | "accepted_probes" | "rejected_probes" | "ws_connection_reused"
   | "active_attempts" | "active_accepted" | "active_rejected";
 /** The per-session totals that outlive a restart. */
-type SessionCounterField = "injectionCount" | "observationCount" | "probeCount" | "reusedCount" | "ticketRoundCount";
+type SessionCounterField = "injectionCount" | "observationCount" | "probeCount" | "reusedCount" | "ticketRoundCount"
+  | "passiveAccepted" | "passiveRejected";
 /** One spelling between a session field and the key it is persisted under. */
 const SESSION_TOTAL_KEYS: Record<SessionCounterField, string> = {
   injectionCount: "injection_count", observationCount: "observation_count", probeCount: "probe_count",
   reusedCount: "ws_connection_reused", ticketRoundCount: "ticket_round_count",
+  passiveAccepted: "passive_accepted", passiveRejected: "passive_rejected",
 };
 /** The one summary shape a synthesized ticket session needs, without the runtime's internals. */
 interface StateDto {
@@ -222,7 +229,8 @@ export class TurnStateRuntime {
       if (keys.length >= 200) for (const stale of keys.slice(0, keys.length - 199)) delete this.sessionTotals[stale];
     }
     this.sessionTotals[key] = { injection_count: s.injectionCount, observation_count: s.observationCount,
-      probe_count: s.probeCount, ws_connection_reused: s.reusedCount, ticket_round_count: s.ticketRoundCount };
+      probe_count: s.probeCount, ws_connection_reused: s.reusedCount, ticket_round_count: s.ticketRoundCount,
+      passive_accepted: s.passiveAccepted, passive_rejected: s.passiveRejected };
     this.persistSoon();
   }
 
@@ -363,6 +371,7 @@ export class TurnStateRuntime {
       const carry = (field: SessionCounterField): number => Math.max(0, Math.trunc(totals[SESSION_TOTAL_KEYS[field]] ?? 0));
       s = { scope, generation: 0, active: null, ready: null, revision: 0, sequence: 0, businessUntil: 0, stopped: prior?.stopped ?? false, nextProbe: prior?.nextProbe ?? 0, failures: prior?.failures ?? 0,
         injectionCount: carry("injectionCount"), observationCount: carry("observationCount"), probeCount: carry("probeCount"), reusedCount: carry("reusedCount"), ticketRoundCount: carry("ticketRoundCount"),
+        passiveAccepted: carry("passiveAccepted"), passiveRejected: carry("passiveRejected"),
         diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null,
         lastUpstreamModel: null, modelMismatch: false, lastResult: null, lastFailure: null };
       this.sessions.set(key, s);
@@ -485,8 +494,10 @@ export class TurnStateRuntime {
         const outcome = this.publish(s, candidate, revision, "passive", undefined, candidateModel !== null && candidateModel !== s.scope.model, candidateModel);
         // Keep the invariant accepted + rejected == observations so the two numbers
         // always reconcile, and a discarded stale observation still counts as "not used".
-        if (outcome.accepted) this.bump("passive_accepted");
-        else this.bump("passive_rejected");
+        // The counter argument is what advances the summary, so the session split and the
+        // summary total move together and neither is counted twice.
+        if (outcome.accepted) this.countSession(s, "passiveAccepted", "passive_accepted");
+        else this.countSession(s, "passiveRejected", "passive_rejected");
       },
     };
   }
@@ -1168,6 +1179,7 @@ export class TurnStateRuntime {
       account_mode: s.scope.plan, plan_provenance: s.scope.provenance,
       phase: s.stopped ? "paused" : s.scope.unsupported ? "unsupported" : s.task ? "collecting" : blocked ? "blocked" : active?.usable ? "usable" : active ? "expired" : "empty",
       active, ready, injection_count: s.injectionCount, observation_count: s.observationCount, probe_count: s.probeCount,
+      passive_accepted: s.passiveAccepted, passive_rejected: s.passiveRejected,
       ws_connection_reused: s.reusedCount, strikes: s.failures, diagnostic: s.diagnostic,
       excluded: isProbeExcluded(s.scope.model),
       last_upstream_model: s.lastUpstreamModel, model_mismatch: s.modelMismatch,
@@ -1193,6 +1205,7 @@ export class TurnStateRuntime {
     return { entry_id: view.entry_id, account_label: scope?.label ?? null, model: view.model,
       account_mode: scope?.plan ?? "personal", plan_provenance: scope?.provenance ?? "assumed_personal",
       injection_count: total("injection_count"), observation_count: total("observation_count"), probe_count: total("probe_count"),
+      passive_accepted: total("passive_accepted"), passive_rejected: total("passive_rejected"),
       ws_connection_reused: total("ws_connection_reused"), ticket_round_count: total("ticket_round_count"), strikes: 0, diagnostic: null,
       excluded: isProbeExcluded(view.model),
       last_upstream_model: null, model_mismatch: false, last_result: null, last_failure: null,
