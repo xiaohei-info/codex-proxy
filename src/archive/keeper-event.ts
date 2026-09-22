@@ -74,6 +74,13 @@ export interface KeeperEvent {
   usage: KeeperUsage | null;
   error_code: string | null;
   error_message: string | null;
+  /**
+   * Whether this record came from an active collection dispatch (harvest /
+   * revalidation) rather than a business request. Absent means a business
+   * request, so legacy events stay valid. The Keeper sink routes these to a
+   * separate `api_group_key` so probe traffic never lands in business totals.
+   */
+  probe?: boolean;
 }
 
 const optionalString = (value: unknown): boolean =>
@@ -104,6 +111,7 @@ export function validateKeeperEvent(value: unknown): value is KeeperEvent {
     optionalMember(event.state_check, KEEPER_STATE_CHECK_VERDICTS) &&
     optionalMember(event.state_check_reason, KEEPER_STATE_CHECK_RULES) &&
     optionalCount(event.state_check_observed_blocks) &&
-    optionalCount(event.state_check_expected_blocks)
+    optionalCount(event.state_check_expected_blocks) &&
+    (event.probe === undefined || typeof event.probe === "boolean")
   );
 }

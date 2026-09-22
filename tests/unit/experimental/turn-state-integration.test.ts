@@ -7,6 +7,7 @@ vi.mock("@src/fingerprint/manager.js", () => ({ buildHeadersWithContentType: () 
 import { buildCodexApi } from "@src/routes/shared/proxy-handler-utils.js";
 import { startTurnState } from "@src/experimental/turn-state/integration.js";
 import { turnStateRuntime as runtime } from "@src/experimental/turn-state/runtime.js";
+import { validateKeeperEvent, type KeeperEvent } from "@src/archive/keeper-event.js";
 import type { AccountPool } from "@src/auth/account-pool.js";
 import type { CookieJar } from "@src/proxy/cookie-jar.js";
 import type { ProxyPool } from "@src/proxy/proxy-pool.js";
@@ -96,5 +97,64 @@ describe("active probe HTTP/account integration", () => {
     pool.acquire.mockReturnValue(null);
     await runtime.probe(entry.id, "actual"); expect(fake.post).not.toHaveBeenCalled();
     expect(runtime.overview().sessions[0].probe_count).toBe(0);
+  });
+});
+
+/**
+ * Active collection must be visible to the Keeper sink: every admitted dispatch is reported as a
+ * `probe: true` event carrying the real upstream model and the state verdict, and a dispatch that
+ * never reached the wire is not reported at all.
+ */
+describe("probe reporting to the Keeper sink", () => {
+  const completed = () => response([{ type: "response.created", response: { model: "actual" } }, { type: "response.completed", response: { status: "completed", model: "actual", usage: { input_tokens: 3, output_tokens: 1 } } }]);
+
+  it("reports one probe event per admitted dispatch, carrying the upstream model and verdict", async () => {
+    const seen: KeeperEvent[] = [];
+    runtime.setProbeSink((e) => seen.push(e));
+    fake.post.mockImplementation(async () => completed());
+    expect(await runtime.probe(entry.id, "actual")).toBe("accepted");
+
+    console.log("  probe events reported: %d, probe flag: %s, model: %s, check: %s",
+      seen.length, seen[0]?.probe, seen[0]?.upstream_model, seen[0]?.state_check);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      probe: true, event_type: "request.completed", failed: false,
+      model: "actual", upstream_model: "actual", state_check: "ok",
+      account_entry_id: entry.id, endpoint: "/codex/responses", status_code: 200,
+    });
+    // `reasoning_tokens` was unobserved, so it is absent rather than a fabricated 0.
+    expect(seen[0].usage).toEqual({ input_tokens: 3, output_tokens: 1 });
+    expect(validateKeeperEvent(seen[0])).toBe(true);
+    // The raw credential must never reach the sink.
+    expect(JSON.stringify(seen)).not.toContain(entry.token);
+  });
+
+  it("does not report a dispatch that stopped before the wire", async () => {
+    const seen: KeeperEvent[] = [];
+    runtime.setProbeSink((e) => seen.push(e));
+    // The lease is valid but the credential rotates while it is held, so `round` bails from
+    // inside its own try — this still reaches `finally`, which is exactly the path the
+    // `admitted` gate has to cover. An `acquire` failure would return before the gate entirely.
+    pool.acquire.mockImplementation(() => { const leased = { ...entry, entryId: entry.id, prevSlotMs: null }; entry.token = "refreshed"; return leased; });
+    await runtime.probe(entry.id, "actual");
+    console.log("  events after a pre-wire bail: %d (must be 0)", seen.length);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("reports a probe failure with its own error code", async () => {
+    const seen: KeeperEvent[] = [];
+    runtime.setProbeSink((e) => seen.push(e));
+    fake.post.mockImplementation(async () => response([{ type: "error", error: { type: "server_error" } }], 500));
+    await runtime.probe(entry.id, "actual");
+    console.log("  failure event: failed=%s status=%s code=%s", seen[0]?.failed, seen[0]?.status_code, seen[0]?.error_code);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ probe: true, event_type: "request.failed", failed: true });
+    expect(validateKeeperEvent(seen[0])).toBe(true);
+  });
+
+  it("is a no-op when no sink is bound", async () => {
+    runtime.setProbeSink(undefined);
+    fake.post.mockImplementation(async () => completed());
+    expect(await runtime.probe(entry.id, "actual")).toBe("accepted");
   });
 });

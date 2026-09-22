@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { CodexApiError } from "../../proxy/codex-types.js";
 import { getDataDir } from "../../paths.js";
+import type { KeeperEvent } from "../../archive/keeper-event.js";
 import { TurnStateConfigSchema, classifyState, digest, isProbeExcluded, parseState, planBlocks, stateApplies, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
 import { TICKET_EXPIRY_MARGIN_MS, ticketBinding, ticketStore, targetCandidate, type TicketObservation } from "./ticket-store.js";
 import { safeModelName, maskProxyUrl } from "./protocol.js";
@@ -50,6 +51,8 @@ interface Session {
   scope: Scope; generation: number; active: State | null; ready: State | null; revision: number; sequence: number;
   businessUntil: number; stopped: boolean; nextProbe: number; failures: number;
   injectionCount: number; observationCount: number; probeCount: number; reusedCount: number;
+  /** Active-collection rounds (ticket path) this scope has run; persisted like the others. */
+  ticketRoundCount: number;
   diagnostic: string | null; lastObserved: number | null; lastInjected: number | null;
   /** Real upstream model the last observation reported, and whether it differed from the request. */
   lastUpstreamModel: string | null; modelMismatch: boolean;
@@ -105,6 +108,11 @@ interface TicketPlan {
 /** One ticket-mode egress attempt: the dedicated harvest proxy or the business route. */
 type TicketSend = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
 /**
+ * Where active-collection events are reported. Bound late: the runtime starts before the archive
+ * exists, and the runtime must not depend on the archive module.
+ */
+export type ProbeSink = (event: KeeperEvent) => void;
+/**
  * The account × model pairs pinned for unconditional collection. Supplied by the integration
  * layer, which owns account enumeration; the runtime itself stays free of account dependencies.
  */
@@ -118,10 +126,11 @@ type SummaryCounter = "injection_count" | "passive_observations" | "passive_acce
   | "active_probes" | "accepted_probes" | "rejected_probes" | "ws_connection_reused"
   | "active_attempts" | "active_accepted" | "active_rejected";
 /** The per-session totals that outlive a restart. */
-type SessionCounterField = "injectionCount" | "observationCount" | "probeCount" | "reusedCount";
+type SessionCounterField = "injectionCount" | "observationCount" | "probeCount" | "reusedCount" | "ticketRoundCount";
 /** One spelling between a session field and the key it is persisted under. */
 const SESSION_TOTAL_KEYS: Record<SessionCounterField, string> = {
-  injectionCount: "injection_count", observationCount: "observation_count", probeCount: "probe_count", reusedCount: "ws_connection_reused",
+  injectionCount: "injection_count", observationCount: "observation_count", probeCount: "probe_count",
+  reusedCount: "ws_connection_reused", ticketRoundCount: "ticket_round_count",
 };
 /** The one summary shape a synthesized ticket session needs, without the runtime's internals. */
 interface StateDto {
@@ -130,6 +139,17 @@ interface StateDto {
 }
 const iso = (n: number | null): string | null => n === null ? null : new Date(n).toISOString();
 const keyOf = (s: Pick<Scope, "entryId" | "model">): string => JSON.stringify([s.entryId, s.model]);
+/**
+ * The reason a probe timeout aborts with. `invalidate()` and `action()` abort with no reason, so
+ * a timeout is the only abort that carries this marker — which is what lets the outcome be
+ * reported as `probe_timeout` instead of the generic `transport_error`.
+ *
+ * A timed-out round is a real dispatch failure (the upstream never answered), so it stays
+ * distinct from a `cancelled` round, where a config save or pause withdrew work in flight.
+ */
+export const PROBE_TIMEOUT_REASON = "probe_timeout";
+/** Whether this controller was aborted by its own timeout rather than by a withdrawal. */
+const timedOut = (controller: AbortController): boolean => controller.signal.reason === PROBE_TIMEOUT_REASON;
 
 /** RAM-only, bounded runtime. Callback owns exact-account leasing and real egress. */
 export class TurnStateRuntime {
@@ -148,6 +168,8 @@ export class TurnStateRuntime {
   private resolve?: (entryId: string, model: string) => Scope | null;
   /** Account × model pairs that collect without waiting for business traffic. Empty by default. */
   private probeModels?: ProbeModelScopes;
+  /** Where active-collection events go once the archive is up; unset means nothing is reported. */
+  private probeSink?: ProbeSink;
   /** Bumped on every config change that invalidates in-flight work, like `generation` but tick-visible. */
   private configEpoch = 0;
   private ticketEvents: Event[] = [];
@@ -200,7 +222,7 @@ export class TurnStateRuntime {
       if (keys.length >= 200) for (const stale of keys.slice(0, keys.length - 199)) delete this.sessionTotals[stale];
     }
     this.sessionTotals[key] = { injection_count: s.injectionCount, observation_count: s.observationCount,
-      probe_count: s.probeCount, ws_connection_reused: s.reusedCount };
+      probe_count: s.probeCount, ws_connection_reused: s.reusedCount, ticket_round_count: s.ticketRoundCount };
     this.persistSoon();
   }
 
@@ -217,6 +239,20 @@ export class TurnStateRuntime {
    */
   startProbeModels(scopes: ProbeModelScopes): void {
     this.probeModels = scopes;
+  }
+  /**
+   * Bind the sink active-collection events are reported to.
+   *
+   * Deliberately separate from `start`: the archive is constructed after the runtime starts, and a
+   * late-bound sink keeps the runtime free of any archive dependency. An unbound sink is a no-op,
+   * so a deployment without the archive enabled simply reports nothing.
+   */
+  setProbeSink(sink: ProbeSink | undefined): void {
+    this.probeSink = sink;
+  }
+  /** Report one active-collection dispatch. A sink failure must never break collection. */
+  emitProbe(event: KeeperEvent): void {
+    try { this.probeSink?.(event); } catch { /* observability must never break collection */ }
   }
   /**
    * Bind the ticket-mode egresses. `harvest` is the dedicated synthetic proxy; `revalidate`
@@ -269,6 +305,7 @@ export class TurnStateRuntime {
     this.transport = undefined;
     this.resolve = undefined;
     this.probeModels = undefined;
+    this.probeSink = undefined;
     this.harvestTransport = undefined;
     this.revalidateTransport = undefined;
   }
@@ -325,7 +362,7 @@ export class TurnStateRuntime {
       const totals = this.sessionTotals[key] ?? {};
       const carry = (field: SessionCounterField): number => Math.max(0, Math.trunc(totals[SESSION_TOTAL_KEYS[field]] ?? 0));
       s = { scope, generation: 0, active: null, ready: null, revision: 0, sequence: 0, businessUntil: 0, stopped: prior?.stopped ?? false, nextProbe: prior?.nextProbe ?? 0, failures: prior?.failures ?? 0,
-        injectionCount: carry("injectionCount"), observationCount: carry("observationCount"), probeCount: carry("probeCount"), reusedCount: carry("reusedCount"),
+        injectionCount: carry("injectionCount"), observationCount: carry("observationCount"), probeCount: carry("probeCount"), reusedCount: carry("reusedCount"), ticketRoundCount: carry("ticketRoundCount"),
         diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null,
         lastUpstreamModel: null, modelMismatch: false, lastResult: null, lastFailure: null };
       this.sessions.set(key, s);
@@ -655,10 +692,11 @@ export class TurnStateRuntime {
     if (s.stopped) return "paused";
     const controller = new AbortController();
     this.ticketControllers.set(key, controller);
-    const timeout = setTimeout(() => controller.abort(), this.config.probe_timeout_seconds * 1000);
+    const timeout = setTimeout(() => controller.abort(PROBE_TIMEOUT_REASON), this.config.probe_timeout_seconds * 1000);
     this.ticketRunning++;
     // A round that got past every guard is one collection attempt, whatever it dispatches inside.
     this.counts.active_attempts++;
+    this.countSession(s, "ticketRoundCount");
     this.persistSoon();
     // Ticket rounds spend the same hard 6/hour/account dispatch budget as active probing:
     // every real harvest or revalidation dispatch is a real upstream request. A round that
@@ -671,7 +709,7 @@ export class TurnStateRuntime {
     };
     const round = run(scope, controller.signal, reserve)
       .then(result => denied ? "budget_exhausted" : result)
-      .catch(() => denied ? "budget_exhausted" : "transport_error")
+      .catch(() => denied ? "budget_exhausted" : timedOut(controller) ? PROBE_TIMEOUT_REASON : "transport_error")
       .then(code => this.settleTicketRound(code))
       .finally(() => { clearTimeout(timeout); this.ticketRunning--; this.ticketControllers.delete(key); this.ticketRounds.delete(key); });
     this.ticketRounds.set(key, round);
@@ -875,7 +913,7 @@ export class TurnStateRuntime {
         const blocked = this.probeBlock(s);
         if (blocked) { resultCode = blocked; break; }
         const revision = ++s.sequence;
-        const timeout = setTimeout(() => controller.abort(), config.probe_timeout_seconds * 1000);
+        const timeout = setTimeout(() => controller.abort(PROBE_TIMEOUT_REASON), config.probe_timeout_seconds * 1000);
         let reserved = false;
         let dispatchOrder = 0;
         let published = false;
@@ -947,7 +985,11 @@ export class TurnStateRuntime {
               safeModelName(result.model), result.stateCheck?.verdict ?? null);
           }
         } catch {
-          resultCode = controller.signal.aborted ? "cancelled" : "transport_error";
+          // A timeout is a real dispatch failure the upstream never answered; every other abort
+          // is a withdrawal (config save, pause), which is `cancelled` rather than a transport fault.
+          resultCode = controller.signal.aborted
+            ? (timedOut(controller) ? PROBE_TIMEOUT_REASON : "cancelled")
+            : "transport_error";
           if (reserved) this.countProbeOutcome(false);
           this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: null, observed_blocks: null, expected_blocks: null });
           this.event(s, "active", "reject", resultCode);
@@ -1130,6 +1172,7 @@ export class TurnStateRuntime {
       excluded: isProbeExcluded(s.scope.model),
       last_upstream_model: s.lastUpstreamModel, model_mismatch: s.modelMismatch,
       last_result: s.lastResult, last_failure: s.lastFailure ? { ...s.lastFailure } : null,
+      ticket_round_count: s.ticketRoundCount,
       last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
   }
   /**
@@ -1150,7 +1193,7 @@ export class TurnStateRuntime {
     return { entry_id: view.entry_id, account_label: scope?.label ?? null, model: view.model,
       account_mode: scope?.plan ?? "personal", plan_provenance: scope?.provenance ?? "assumed_personal",
       injection_count: total("injection_count"), observation_count: total("observation_count"), probe_count: total("probe_count"),
-      ws_connection_reused: total("ws_connection_reused"), strikes: 0, diagnostic: null,
+      ws_connection_reused: total("ws_connection_reused"), ticket_round_count: total("ticket_round_count"), strikes: 0, diagnostic: null,
       excluded: isProbeExcluded(view.model),
       last_upstream_model: null, model_mismatch: false, last_result: null, last_failure: null,
       last_observed_at: null, last_injected_at: view.used_at, next_probe_at: null, active };

@@ -205,6 +205,13 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
     exportMaxBytes: config.archive.export_max_bytes,
     maxInFlightBytes: config.archive.max_inflight_bytes,
   });
+  // The runtime starts before the archive exists, so its probe sink is bound here rather than at
+  // `startTurnState`. Active-collection dispatches are reported as `probe: true` events, which the
+  // Keeper sink keeps in a separate group from business traffic.
+  turnStateRuntime.setProbeSink((event) => {
+    if (!requestArchive.isEnabled()) return;
+    requestArchive.recordCompleted({ event, requestHeaders: {}, requestBody: null, responseHeaders: {}, responseBody: null });
+  });
 
   // Mount routes
   const authRoutes = createAuthRoutes(accountPool, refreshScheduler);
