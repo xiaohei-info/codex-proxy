@@ -83,16 +83,21 @@ describe("turn-state runtime", () => {
     r.update({ enabled: true, mode: "always", active_enabled: true });
     expect(await r.probe("entry", "model")).toBe("cooldown");
   });
-  it("budget survives config/clear/credential changes and spans models", async () => {
+  it("keeps the rolling dispatch window across config/clear/credential changes and expires it after an hour", async () => {
     const { runtime: r, advance, identity } = setup(async (_s, _a, reserve) => ({ completed: reserve(), value: token() }));
     for (let i = 0; i < 6; i++) expect(await r.probe("entry", `model${i}`)).toBe("model_unknown");
+    expect(r.overview().summary.active_last_hour).toBe(6);
+    // Config, clear and credential changes must not wipe the window.
     r.action("entry", "model0", "clear");
     identity({ ...scope, identity: "new", credential: "new" });
     r.update({ enabled: true, mode: "observe", active_enabled: true });
-    expect(await r.probe("entry", "model7")).toBe("budget_exhausted");
-    expect(r.overview().summary.active_probes).toBe(6);
+    expect(r.overview().summary.active_last_hour).toBe(6);
+    // The per-account ceiling is gone by design, so a further dispatch is admitted.
+    expect(await r.probe("entry", "model7")).toBe("model_unknown");
+    expect(r.overview().summary.active_last_hour).toBe(7);
+    // The window rolls: an hour later nothing from before is still counted.
     advance(3601_000);
-    expect(await r.probe("entry", "model8")).not.toBe("budget_exhausted");
+    expect(r.overview().summary.active_last_hour).toBe(0);
   });
   it.each([401, 403, 402, 429])("blocks account across models on %s and retains guards on clear", async status => {
     const send = vi.fn(async (_s, _a, reserve) => { reserve(); return { completed: false, status, retryAfter: 900 }; });

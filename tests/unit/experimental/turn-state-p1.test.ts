@@ -140,7 +140,7 @@ describe("P1 same-identity effective plan changes", () => {
     expect(r.begin(scope(), undefined)).toBeNull();
     expect(await r.probe("account", "a")).toBe("paused");
   });
-  it("does not reset the rolling dispatch budget when only the plan changes", async () => {
+  it("does not reset the rolling dispatch window when only the plan changes", async () => {
     const { r, pending, change, scope } = setup();
     r.update({ ...r.config, max_attempts_per_round: 1 });
     for (let i = 0; i < 6; i++) {
@@ -148,11 +148,13 @@ describe("P1 same-identity effective plan changes", () => {
       const result = r.probe("account", `model${i}`); await started();
       pending[i].finish({ completed: true, value: token(scope().plan) }); await result;
     }
+    expect(r.overview().summary.active_last_hour).toBe(6);
     change({ plan: "personal" });
-    const blocked = r.probe("account", "last"); await started();
-    pending[6].finish({ completed: false });
-    expect(await blocked).toBe("budget_exhausted");
-    expect(r.overview().summary.active_probes).toBe(6);
+    const next = r.probe("account", "last"); await started();
+    pending[6].finish({ completed: false }); await next;
+    // The plan switch left the window intact: it now carries all seven dispatches rather than a
+    // reset one. That is the invariant the old budget-exhausted assertion was protecting.
+    expect(r.overview().summary.active_last_hour).toBe(7);
   });
   it("preserves credential auth and account budget across a plan-only change", async () => {
     const { r, pending, change, scope } = setup();

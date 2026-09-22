@@ -29,6 +29,20 @@ export function startTurnState(accountPool: AccountPool, cookieJar: CookieJar, p
       plan, provenance };
   };
   turnStateRuntime.update(getConfig().experimental_turn_state ?? {});
+  // The account registry is the only place that knows which accounts are live, so pinned
+  // collection is enumerated here rather than inside the runtime (which takes no account
+  // dependency). Reloading the config after the seam is bound is what keeps `probe_models`
+  // changes effective without a restart.
+  turnStateRuntime.startProbeModels(() => {
+    const models = turnStateRuntime.config.probe_models;
+    if (models.length === 0) return [];
+    const pairs: Array<{ entryId: string; model: string }> = [];
+    for (const entry of accountPool.getAllEntries()) {
+      if (entry.status !== "active") continue;
+      for (const model of models) pairs.push({ entryId: entry.id, model });
+    }
+    return pairs;
+  });
   /**
    * One leasing + dispatch round. `egressRoute` selects the network path: the account's own
    * business route for probing and for ticket revalidation, or the dedicated

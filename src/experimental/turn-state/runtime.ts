@@ -104,6 +104,11 @@ interface TicketPlan {
 }
 /** One ticket-mode egress attempt: the dedicated harvest proxy or the business route. */
 type TicketSend = (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
+/**
+ * The account × model pairs pinned for unconditional collection. Supplied by the integration
+ * layer, which owns account enumeration; the runtime itself stays free of account dependencies.
+ */
+export type ProbeModelScopes = () => Array<{ entryId: string; model: string }>;
 /** The one spelling between a transport kind and the auditable ticket event result. */
 const WIRE_RESULTS: Record<WireKind, string> = { http: "http", new: "ws_new", reuse: "ws_connection_reused" };
 /** The ticket-layer counters, one per dispatch decision the operator can observe. */
@@ -141,6 +146,8 @@ export class TurnStateRuntime {
   private timer?: ReturnType<typeof setInterval>;
   private transport?: ProbeTransport;
   private resolve?: (entryId: string, model: string) => Scope | null;
+  /** Account × model pairs that collect without waiting for business traffic. Empty by default. */
+  private probeModels?: ProbeModelScopes;
   /** Bumped on every config change that invalidates in-flight work, like `generation` but tick-visible. */
   private configEpoch = 0;
   private ticketEvents: Event[] = [];
@@ -204,6 +211,14 @@ export class TurnStateRuntime {
     this.timer.unref?.();
   }
   /**
+   * Bind the pinned-collection source. The callback reports the account × model pairs named by
+   * `probe_models`, so the scheduler can collect on them on their own cadence instead of only
+   * after a business request happens to touch them.
+   */
+  startProbeModels(scopes: ProbeModelScopes): void {
+    this.probeModels = scopes;
+  }
+  /**
    * Bind the ticket-mode egresses. `harvest` is the dedicated synthetic proxy; `revalidate`
    * re-runs a candidate through the account's own business route. Both are separate from the
    * generic `ProbeTransport`, so ticket mode never reads or writes the generic snapshot.
@@ -253,6 +268,7 @@ export class TurnStateRuntime {
     this.ticketRunning = 0;
     this.transport = undefined;
     this.resolve = undefined;
+    this.probeModels = undefined;
     this.harvestTransport = undefined;
     this.revalidateTransport = undefined;
   }
@@ -690,6 +706,11 @@ export class TurnStateRuntime {
     const now = this.now();
     for (const view of ticketStore.list(now)) {
       if (this.ticketRounds.has(keyOf({ entryId: view.entry_id, model: view.model }))) continue;
+      // The cooldown is the one rate limit, not just the scheduler's. Without this check a
+      // refresh pass would dispatch on its own cadence and bypass the backoff the scheduler set
+      // after the previous failure, making the two paths disagree about how often a scope runs.
+      const s = this.sessions.get(keyOf({ entryId: view.entry_id, model: view.model }));
+      if (s && s.nextProbe > now) continue;
       if (view.state === "verified") {
         if (view.expires_at === null || Date.parse(view.expires_at) - now > this.config.refresh_before_seconds * 1000) continue;
       } else if (view.state === "revalidating") {
@@ -784,14 +805,30 @@ export class TurnStateRuntime {
     return null;
   }
   /**
-   * The shared hard 6/hour/account dispatch budget. Pure: no session diagnostics and no probe
-   * counters, so both active probing and ticket rounds spend from the same rolling window.
+   * The shared dispatch budget. Pure: no session diagnostics and no probe counters, so both active
+   * probing and ticket rounds spend from the same rolling window.
+   *
+   * Deliberately has no per-hour dispatch ceiling: the cooldown is the rate limit, and a hard cap
+   * on top of it would only make the operator recompute a number every time `probe_models` changes.
+   * The `budgets` map is still bounded so an unbounded account set cannot grow it without limit.
    */
   private budget(entryId: string): boolean {
+    if (!this.budgets.has(entryId) && this.budgets.size >= 200) return false;
     const times = this.budgetTimes(entryId);
-    if (times.length >= 6 || (!this.budgets.has(entryId) && this.budgets.size >= 200)) return false;
     times.push(this.now()); this.budgets.set(entryId, times);
     return true;
+  }
+  /**
+   * Real dispatches admitted in the trailing 60 minutes, across every account.
+   *
+   * Read from the same `budgets` window the limiter itself uses, so the reported rate can never
+   * drift from the mechanism that produces it.
+   */
+  private dispatchesLastHour(): number {
+    const cutoff = this.now() - 3600_000;
+    let total = 0;
+    for (const times of this.budgets.values()) for (const at of times) if (at > cutoff) total++;
+    return total;
   }
   private reserve(s: Session): boolean {
     if (this.probeBlock(s)) return false;
@@ -979,10 +1016,30 @@ export class TurnStateRuntime {
     }
     void this.probe(s.scope.entryId, s.scope.model);
   }
+  /** Whether this model is pinned for collection that does not wait for business traffic. */
+  private isPinnedModel(model: string): boolean {
+    return this.config.probe_models.includes(model);
+  }
+  /**
+   * Ensure a session exists for every pinned account × model pair.
+   *
+   * Sessions are otherwise created by business requests, which is exactly why a pinned model that
+   * nobody happens to use would never be scheduled at all. Pinning has to create the slot before
+   * the scheduler can drive it; `session` is also what applies the capacity bound.
+   */
+  private ensurePinnedSessions(): void {
+    if (this.config.probe_models.length === 0 || !this.probeModels) return;
+    for (const { entryId, model } of this.probeModels()) {
+      if (!this.isPinnedModel(model)) continue;
+      const scope = this.resolve?.(entryId, model);
+      if (scope) this.session(scope);
+    }
+  }
   tick(): void {
     // Ticket refresh is its own decision layer: it runs whether or not generic mode is enabled.
     this.refreshTickets();
     if (!this.enabled()) return;
+    this.ensurePinnedSessions();
     for (const [key, s] of this.sessions) {
       if (!this.current(s)) {
         s.abort?.abort(); s.active = null; s.ready = null;
@@ -990,11 +1047,15 @@ export class TurnStateRuntime {
         continue;
       }
       this.promote(s);
-      if (!s.stopped && !s.task && s.nextProbe <= this.now() && s.businessUntil + 3600_000 < this.now()) { this.sessions.delete(key); continue; }
+      // A pinned model keeps its slot whether or not business traffic touched it; every other
+      // scope is an idle-session hygiene candidate, exactly as before.
+      const pinned = this.isPinnedModel(s.scope.model);
+      if (!pinned && !s.stopped && !s.task && s.nextProbe <= this.now() && s.businessUntil + 3600_000 < this.now()) { this.sessions.delete(key); continue; }
       if (!this.config.active_enabled || s.stopped || isProbeExcluded(s.scope.model)) continue;
-      // Background collection only runs for a scope that has seen business traffic recently and
-      // is not already inside its cooldown.
-      if (s.businessUntil <= this.now() || s.nextProbe > this.now()) continue;
+      // Background collection only runs for a scope that is not already inside its cooldown. A
+      // pinned model is additionally exempt from the business-traffic freshness gate, because
+      // waiting for traffic is the very thing pinning exists to avoid.
+      if (s.nextProbe > this.now() || (!pinned && s.businessUntil <= this.now())) continue;
       // Nothing to collect while a fresh state, or a usable backup, is already on hand.
       if (this.usable(s.ready)) continue;
       if (this.usable(s.active) && s.active.expires - this.now() > this.config.refresh_before_seconds * 1000) continue;
@@ -1042,6 +1103,9 @@ export class TurnStateRuntime {
         ready: sessions.filter(s => (s.ready as StateDto | null)?.usable).length, collecting: sessions.filter(s => s.phase === "collecting").length,
         expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length,
         since: this.metrics.epoch() || null,
+        // A rate, not a total: `active_attempts` says how often collection has ever run, this
+        // says how fast it is running right now, which is the number an operator throttles on.
+        active_last_hour: this.dispatchesLastHour(),
         ...this.counts, ...this.ticketCounts },
       tickets: ticketStore.list(this.now()),
       // Ticket events share the generic 200-event cap: the merged list is truncated to the

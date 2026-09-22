@@ -56,6 +56,7 @@ export function TurnStateSettings() {
     passive_enabled: t("turnStatePassive"), active_enabled: t("turnStateActive"),
     harvest_proxy_url: t("turnStateHarvestProxy"), revalidate: t("turnStateRevalidate"),
     prefer_http_transport: t("turnStatePreferHttp"),
+    probe_models: t("turnStateProbeModels"),
     mismatch_is_success: t("turnStateMismatchSuccess"), account_mode: t("turnStateAccountPlan"),
     ttl_seconds: t("turnStateTtl"), refresh_before_seconds: t("turnStateRefreshWindow"),
     probe_timeout_seconds: t("turnStateProbeTimeout"), cooldown_seconds: t("turnStateCooldown"),
@@ -69,6 +70,21 @@ export function TurnStateSettings() {
   const inputCls = "w-full max-w-[180px] px-3 py-2 bg-white dark:bg-bg-dark border border-gray-200 dark:border-border-dark rounded-lg text-xs text-slate-700 dark:text-text-main outline-none focus:ring-1 focus:ring-primary";
   const timingHints: Record<string, Parameters<typeof t>[0]> = { ttl_seconds: "turnStateTtl", refresh_before_seconds: "turnStateRefreshWindow", probe_timeout_seconds: "turnStateProbeTimeout", cooldown_seconds: "turnStateCooldown", max_attempts_per_round: "turnStateAttempts", revoke_after_signals: "turnStateRevokeSignalsHint" };
   const update = (key: string, value: unknown) => setConfig((current) => current ? { ...current, [key]: value } : current);
+  /**
+   * The pinned list is edited as free text, one model per line: split, trim, drop blanks and keep
+   * the first spelling of a duplicate, so the textarea and the zod schema agree on one value.
+   */
+  const parseProbeModels = (raw: string): string[] => {
+    const seen = new Set<string>();
+    const models: string[] = [];
+    for (const line of raw.split("\n")) {
+      const model = line.trim();
+      if (model === "" || seen.has(model)) continue;
+      seen.add(model);
+      models.push(model);
+    }
+    return models;
+  };
   const toggle = (key: "passive_enabled" | "active_enabled" | "revalidate" | "prefer_http_transport" | "mismatch_is_success", hint: Parameters<typeof t>[0]) =>
     <SettingItemControl label={fieldLabels[key]} hint={t(hint)} saving={busy} saved={false} isDirty={false} requiresRestart={false}>
       <input type="checkbox" checked={config?.[key] ?? false} disabled={busy} onChange={e => update(key, e.currentTarget.checked)} class="w-4 h-4 rounded border-gray-300 dark:border-border-dark text-primary focus:ring-primary cursor-pointer" />
@@ -98,6 +114,13 @@ export function TurnStateSettings() {
         {toggle("prefer_http_transport", "turnStatePreferHttpHint")}
         <SettingItemControl label={fieldLabels.harvest_proxy_url} hint={t("turnStateHarvestProxyHint")} saving={busy} saved={false} isDirty={false} requiresRestart={false}>
           <input class={inputCls} type="text" maxLength={512} placeholder="http://host:port" value={config.harvest_proxy_url ?? ""} disabled={busy} onInput={e => update("harvest_proxy_url", e.currentTarget.value || null)} />
+        </SettingItemControl>
+        <SettingItemControl label={fieldLabels.probe_models} hint={t("turnStateProbeModelsHint")} saving={busy} saved={false} isDirty={false} requiresRestart={false}>
+          <div class="w-full max-w-[420px]">
+            <textarea class={inputCls + " max-w-none h-20 font-mono"} rows={3} maxLength={4096} value={config.probe_models.join("\n")} disabled={busy}
+              onInput={e => update("probe_models", parseProbeModels(e.currentTarget.value))} />
+            <p class="text-xs text-slate-500 dark:text-text-dim mt-1">{t("turnStateProbeModelsCount", { count: config.probe_models.length })}</p>
+          </div>
         </SettingItemControl>
         {toggle("revalidate", "turnStateRevalidateHint")}
         {overview && (overview.tickets ?? []).length > 0 && <div class="py-2">

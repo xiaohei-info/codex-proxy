@@ -15,6 +15,25 @@ export function validProxyUrl(value: string): boolean {
 }
 
 /**
+ * Textarea input arrives as free lines, so a pinned-model list is normalized before validation:
+ * trim each entry, drop blanks, and keep the first spelling of a duplicate. A non-array value is
+ * passed through untouched so the schema still reports it as invalid.
+ */
+export function normalizeProbeModels(input: unknown): unknown {
+  if (!Array.isArray(input)) return input;
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const raw of input) {
+    if (typeof raw !== "string") continue;
+    const model = raw.trim();
+    if (model === "" || seen.has(model)) continue;
+    seen.add(model);
+    models.push(model);
+  }
+  return models;
+}
+
+/**
  * One flat configuration for the experiment. The three sections are orthogonal:
  *
  * - experiment: `enabled` / `mode` / `fallback` are the only things that decide whether a
@@ -37,6 +56,15 @@ export const TurnStateConfigFields = z.object({
   active_enabled: z.boolean().default(false),
   /** Dedicated egress for collection. `null` collects over the account's own business route. */
   harvest_proxy_url: z.string().max(512).refine(validProxyUrl, { message: "harvest_proxy_url must be an http/https/socks5/socks5h origin without path, query or fragment" }).nullable().default(null),
+  /**
+   * Models pinned for unconditional background collection, global across active accounts.
+   *
+   * A pinned model collects on its own cooldown cadence whether or not business traffic has
+   * touched it. Every other model keeps waiting for a business request first. Empty (the
+   * default) leaves the original business-traffic-driven behaviour untouched.
+   */
+  probe_models: z.preprocess(normalizeProbeModels,
+    z.array(z.string().max(128).regex(/^[a-zA-Z0-9._:/-]{1,128}$/, { message: "probe_models entries must be model IDs" })).max(32).default([])),
   /** Re-dispatch a harvested candidate and require the upstream to accept it before trusting it. */
   revalidate: z.boolean().default(true),
   /**

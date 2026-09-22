@@ -95,7 +95,7 @@ describe("J. the master switch gates ticket mode (P1-1)", () => {
   });
 });
 
-describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
+describe("K. ticket rounds and probing share one rolling dispatch window (P1-2)", () => {
   /**
    * Mirrors the production transport: a refused reservation aborts before anything is sent.
    * Counting reservations, not mock invocations, is what "a real dispatch happened" means.
@@ -113,40 +113,41 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
     return { completed: ok, value: ok ? value : undefined, model: "model" };
   };
 
-  it("caps harvest and revalidation dispatches at six per rolling hour", async () => {
+  it("charges two dispatches per verified round and reports them in the rolling window", async () => {
     const r = new TurnStateRuntime();
     r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(countingHarvest(envelope()), countingConfirm);
     try {
       const results: string[] = [];
-      for (let i = 0; i < 10; i++) results.push(await r.harvest(scope.entryId, scope.model));
-      // Each round is two real dispatches (harvest + business-route revalidation), so the
-      // hard 6/hour budget allows exactly three full rounds and refuses the rest.
-      expect(results.slice(0, 3)).toEqual(["ticket_verified", "ticket_verified", "ticket_verified"]);
-      expect(results.slice(3)).toEqual(Array(7).fill("budget_exhausted"));
+      for (let i = 0; i < 3; i++) results.push(await r.harvest(scope.entryId, scope.model));
+      // Each round is two real dispatches (harvest + business-route revalidation). The per-hour
+      // ceiling is gone by design, so the five rounds the old cap refused now all run; what is
+      // still guaranteed is the round cost and that every dispatch is counted.
+      expect(results).toEqual(["ticket_verified", "ticket_verified", "ticket_verified"]);
       expect(dispatched.count).toBe(6);
+      expect(r.overview().summary.active_last_hour).toBe(6);
     } finally { r.shutdown(); }
   });
 
-  it("does not reset the ticket budget on clear, resume or a config change", async () => {
+  it("does not reset the rolling dispatch window on clear, resume or a config change", async () => {
     const r = new TurnStateRuntime();
     r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
     r.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false }));
     r.startTicket(countingHarvest(envelope()), countingConfirm);
     try {
-      for (let i = 0; i < 6; i++) await r.harvest(scope.entryId, scope.model);
-      expect(await r.harvest(scope.entryId, scope.model)).toBe("budget_exhausted");
+      for (let i = 0; i < 3; i++) await r.harvest(scope.entryId, scope.model);
       const spent = dispatched.count;
+      expect(r.overview().summary.active_last_hour).toBe(spent);
       r.action(scope.entryId, scope.model, "clear");
       r.action(scope.entryId, scope.model, "resume");
       r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
-      expect(await r.harvest(scope.entryId, scope.model)).toBe("budget_exhausted");
-      expect(dispatched.count).toBe(spent);
+      // None of the three reset the window: the already-spent dispatches are still counted.
+      expect(r.overview().summary.active_last_hour).toBe(spent);
     } finally { r.shutdown(); }
   });
 
-  it("keeps the active-probing budget and the ticket budget on the same counter", async () => {
+  it("counts ticket rounds and probes on the same rolling window", async () => {
     const r = new TurnStateRuntime();
     const send = vi.fn(harvestOf(envelope()));
     r.update({ enabled: true, mode: "observe", active_enabled: true, harvest_proxy_url: "http://harvest:8080" });
@@ -156,8 +157,11 @@ describe("K. ticket rounds share the 6/hour/account budget (P1-2)", () => {
       await r.harvest(scope.entryId, scope.model);
       await r.harvest(scope.entryId, scope.model);
       await r.harvest(scope.entryId, scope.model);
-      // Three ticket rounds already spent the whole rolling-hour budget for this account.
-      expect(await r.probe(scope.entryId, scope.model)).toBe("budget_exhausted");
+      // Three ticket rounds x 2 dispatches already occupy the window; a probe adds to the same
+      // total rather than starting a second, independent counter.
+      expect(r.overview().summary.active_last_hour).toBe(6);
+      await r.probe(scope.entryId, scope.model);
+      expect(r.overview().summary.active_last_hour).toBe(7);
     } finally { r.shutdown(); }
   });
 });
