@@ -68,6 +68,9 @@ const confirms: Candidate = async (_s, value, _a, reserve) => ({ completed: rese
 beforeEach(() => {
   fake.post.mockReset();
   sockets.length = 0;
+  // The cumulative totals are process-scoped and persisted now, so a suite must start from a
+  // known zero instead of whatever a sibling test (or the deployment) left behind.
+  runtime.redirectMetrics();
   dir = mkdtempSync(join(tmpdir(), "tickets-"));
   ticketStore.redirectTo(join(dir, "codex-tickets.json"));
   // A fresh entry per test: the probe budget is a hard 6/hour/entry that outlives a shutdown.

@@ -18,6 +18,8 @@ let assignment: string;
 let routes: { getAssignment: () => string; resolveProxyUrl: ReturnType<typeof vi.fn> };
 beforeEach(() => {
   fake.post.mockReset();
+  // Cumulative totals persist now; keep this suite's figures process-scoped and out of data/.
+  runtime.redirectMetrics();
   entry = { id: `entry-${++id}`, token: "credential-never-serialized", accountId: null, status: "active", planType: "plus", label: "test" };
   pool = { getEntry: vi.fn(() => entry), getAllEntries: () => [entry], acquire: vi.fn(() => ({ ...entry, entryId: entry.id, prevSlotMs: null })), releaseWithoutCounting: vi.fn(), updateCachedQuota: vi.fn(), applyRateLimit429: vi.fn() };
   assignment = "direct";

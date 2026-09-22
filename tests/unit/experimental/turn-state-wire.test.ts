@@ -30,7 +30,7 @@ async function drain(a: CodexApi, response: Response) { for await (const _ of a.
 async function waitUntil(fn: () => boolean) { for (let i = 0; i < 100; i++) { if (fn()) return; await new Promise(r => setTimeout(r, 0)); } throw new Error("mock wire timeout"); }
 function http(events: string, value?: string) { return { status: 200, headers: new Headers(value ? { "x-codex-turn-state": value } : {}), body: new Response(events).body!, setCookieHeaders: [] }; }
 const complete = 'event: response.completed\ndata: {"response":{"status":"completed"}}\n\n';
-beforeEach(() => { sockets.length = 0; runtime.update({ enabled: true, mode: "always", passive_enabled: true }); runtime.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false })); });
+beforeEach(() => { sockets.length = 0; runtime.redirectMetrics(); runtime.update({ enabled: true, mode: "always", passive_enabled: true }); runtime.start((entryId, model) => ({ ...scope, entryId, model }), async () => ({ completed: false })); });
 afterEach(() => runtime.shutdown());
 describe("turn-state actual transport seams", () => {
   it("injects HTTP header without mutating input/body and commits only completed responses", async () => {

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { CodexApiError } from "../../proxy/codex-types.js";
-import { TurnStateConfigSchema, classifyState, isProbeExcluded, parseState, stateApplies, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
-import { ticketBinding, ticketStore, targetCandidate, type TicketObservation } from "./ticket-store.js";
+import { getDataDir } from "../../paths.js";
+import { TurnStateConfigSchema, classifyState, digest, isProbeExcluded, parseState, planBlocks, stateApplies, type ParsedState, type Plan, type StateCheckVerdict, type StateRule, type TurnStateConfig } from "./policy.js";
+import { TICKET_EXPIRY_MARGIN_MS, ticketBinding, ticketStore, targetCandidate, type TicketObservation } from "./ticket-store.js";
 import { safeModelName, maskProxyUrl } from "./protocol.js";
+import { MetricsStore } from "./metrics-store.js";
 
 export interface Scope {
   entryId: string;
@@ -104,7 +107,22 @@ type TicketSend = (scope: Scope, signal: AbortSignal, reserve: () => boolean) =>
 /** The one spelling between a transport kind and the auditable ticket event result. */
 const WIRE_RESULTS: Record<WireKind, string> = { http: "http", new: "ws_new", reuse: "ws_connection_reused" };
 /** The ticket-layer counters, one per dispatch decision the operator can observe. */
-type TicketCounter = "ticket_injected" | "ticket_unverified" | "ticket_revalidation_failed" | "ticket_reused_skipped" | "ticket_revalidation_attempts";
+type TicketCounter = "ticket_injected" | "ticket_verified" | "ticket_unverified" | "ticket_revalidation_failed" | "ticket_reused_skipped" | "ticket_revalidation_attempts";
+/** Summary totals. Cumulative: loaded from the metrics store and written back on every change. */
+type SummaryCounter = "injection_count" | "passive_observations" | "passive_accepted" | "passive_rejected"
+  | "active_probes" | "accepted_probes" | "rejected_probes" | "ws_connection_reused"
+  | "active_attempts" | "active_accepted" | "active_rejected";
+/** The per-session totals that outlive a restart. */
+type SessionCounterField = "injectionCount" | "observationCount" | "probeCount" | "reusedCount";
+/** One spelling between a session field and the key it is persisted under. */
+const SESSION_TOTAL_KEYS: Record<SessionCounterField, string> = {
+  injectionCount: "injection_count", observationCount: "observation_count", probeCount: "probe_count", reusedCount: "ws_connection_reused",
+};
+/** The one summary shape a synthesized ticket session needs, without the runtime's internals. */
+interface StateDto {
+  usable: boolean; length: number; blocks: number; fingerprint: string;
+  issued_at: string; expires_at: string; route_id: string | null; version: number;
+}
 const iso = (n: number | null): string | null => n === null ? null : new Date(n).toISOString();
 const keyOf = (s: Pick<Scope, "entryId" | "model">): string => JSON.stringify([s.entryId, s.model]);
 
@@ -126,7 +144,7 @@ export class TurnStateRuntime {
   /** Bumped on every config change that invalidates in-flight work, like `generation` but tick-visible. */
   private configEpoch = 0;
   private ticketEvents: Event[] = [];
-  private ticketCounts = { ticket_injected: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
+  private ticketCounts: Record<TicketCounter, number> = { ticket_injected: 0, ticket_verified: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
   /** The two ticket-mode egresses: the dedicated harvest proxy, and the account's business route. */
   private harvestTransport?: (scope: Scope, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
   private revalidateTransport?: (scope: Scope, value: string, signal: AbortSignal, reserve: () => boolean) => Promise<ProbeResult>;
@@ -134,8 +152,50 @@ export class TurnStateRuntime {
   private ticketRounds = new Map<string, Promise<string>>();
   private ticketControllers = new Map<string, AbortController>();
   private ticketRunning = 0;
-  private counts = { injection_count: 0, passive_observations: 0, passive_accepted: 0, passive_rejected: 0, active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0 };
-  constructor(private now: () => number = Date.now) {}
+  private counts: Record<SummaryCounter, number> = { injection_count: 0, passive_observations: 0, passive_accepted: 0, passive_rejected: 0,
+    active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0,
+    active_attempts: 0, active_accepted: 0, active_rejected: 0 };
+  /** Per-scope totals, authoritative and persisted, so a counter survives its session's eviction. */
+  private sessionTotals: Record<string, Record<string, number>> = {};
+  private hydrated = false;
+  /**
+   * `metrics` defaults to memory-only so a throwaway runtime (unit tests) never reads or writes the
+   * deployment's data directory. The process-wide singleton opts into the file explicitly.
+   */
+  constructor(private now: () => number = Date.now, private metrics: MetricsStore = new MetricsStore()) {
+    // Adopt persisted totals before anything can increment, so the first `++` lands on the
+    // historical value instead of a process-fresh zero.
+    this.hydrate();
+  }
+  /** Adopt the persisted totals once, before the first read or write of this process scope. */
+  private hydrate(): void {
+    if (this.hydrated) return;
+    this.hydrated = true;
+    const saved = this.metrics.read();
+    for (const key of Object.keys(this.counts) as SummaryCounter[]) if (typeof saved.counters[key] === "number") this.counts[key] = saved.counters[key];
+    for (const key of Object.keys(this.ticketCounts) as TicketCounter[]) if (typeof saved.counters[key] === "number") this.ticketCounts[key] = saved.counters[key];
+    this.sessionTotals = saved.sessions;
+  }
+  private persistSoon(): void {
+    this.metrics.save({ ...this.counts, ...this.ticketCounts }, this.sessionTotals);
+  }
+  private bump(counter: SummaryCounter): void {
+    this.counts[counter]++;
+    this.persistSoon();
+  }
+  /** Raise one session total, mirroring it into the persisted per-scope map. */
+  private countSession(s: Session, field: SessionCounterField, counter: SummaryCounter | null = null): void {
+    s[field]++;
+    if (counter !== null) this.counts[counter]++;
+    const key = keyOf(s.scope);
+    if (!this.sessionTotals[key]) {
+      const keys = Object.keys(this.sessionTotals);
+      if (keys.length >= 200) for (const stale of keys.slice(0, keys.length - 199)) delete this.sessionTotals[stale];
+    }
+    this.sessionTotals[key] = { injection_count: s.injectionCount, observation_count: s.observationCount,
+      probe_count: s.probeCount, ws_connection_reused: s.reusedCount };
+    this.persistSoon();
+  }
 
   start(resolve: (entryId: string, model: string) => Scope | null, transport: ProbeTransport): void {
     this.resolve = resolve;
@@ -185,8 +245,8 @@ export class TurnStateRuntime {
     clearInterval(this.timer);
     this.timer = undefined;
     this.sessions.clear();
-    // Tickets themselves persist (that is their point); only the process-scoped counters reset.
-    this.ticketCounts = { ticket_injected: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
+    // The counters are cumulative and persisted, so a shutdown must not lose the last increment.
+    this.metrics.flush();
     this.ticketEvents = [];
     this.ticketRounds.clear();
     this.ticketControllers.clear();
@@ -197,6 +257,21 @@ export class TurnStateRuntime {
     this.revalidateTransport = undefined;
   }
   resolveScope(entryId: string, model: string): Scope | null { return this.resolve?.(entryId, model) ?? null; }
+  /**
+   * Test seam only: point the cumulative totals at another file and adopt what it holds, so a
+   * suite never reads or writes the deployment's data directory. Mirrors `TicketStore.redirectTo`.
+   * Omitting `file` detaches the store entirely, leaving the counters in memory.
+   */
+  redirectMetrics(file?: () => string): void {
+    this.metrics = new MetricsStore(file, this.now);
+    this.hydrated = false;
+    this.counts = { injection_count: 0, passive_observations: 0, passive_accepted: 0, passive_rejected: 0,
+      active_probes: 0, accepted_probes: 0, rejected_probes: 0, ws_connection_reused: 0,
+      active_attempts: 0, active_accepted: 0, active_rejected: 0 };
+    this.ticketCounts = { ticket_injected: 0, ticket_verified: 0, ticket_unverified: 0, ticket_revalidation_failed: 0, ticket_reused_skipped: 0, ticket_revalidation_attempts: 0 };
+    this.sessionTotals = {};
+    this.hydrate();
+  }
   private enabled(): boolean { return this.config.enabled && this.config.mode !== "off"; }
   /**
    * Whether a raw turn state may appear in streamed bytes, so raw debug chunks cannot be
@@ -231,8 +306,11 @@ export class TurnStateRuntime {
         if (!idle) return null;
         this.sessions.delete(idle[0]);
       }
+      const totals = this.sessionTotals[key] ?? {};
+      const carry = (field: SessionCounterField): number => Math.max(0, Math.trunc(totals[SESSION_TOTAL_KEYS[field]] ?? 0));
       s = { scope, generation: 0, active: null, ready: null, revision: 0, sequence: 0, businessUntil: 0, stopped: prior?.stopped ?? false, nextProbe: prior?.nextProbe ?? 0, failures: prior?.failures ?? 0,
-        injectionCount: 0, observationCount: 0, probeCount: 0, reusedCount: 0, diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null,
+        injectionCount: carry("injectionCount"), observationCount: carry("observationCount"), probeCount: carry("probeCount"), reusedCount: carry("reusedCount"),
+        diagnostic: prior?.stopped ? "paused" : scope.unsupported ?? null, lastObserved: null, lastInjected: null,
         lastUpstreamModel: null, modelMismatch: false, lastResult: null, lastFailure: null };
       this.sessions.set(key, s);
     }
@@ -328,10 +406,10 @@ export class TurnStateRuntime {
         if (generation === this.generation && scopeGeneration === s.generation && this.current(s) && !s.stopped)
           s.businessUntil = this.now() + 30 * 60_000;
         if (kind === "reuse") {
-          s.reusedCount++; this.counts.ws_connection_reused++; if (!s.stopped) s.diagnostic = "ws_connection_reused";
+          this.countSession(s, "reusedCount", "ws_connection_reused"); if (!s.stopped) s.diagnostic = "ws_connection_reused";
           this.event(s, "injection", "skip", "ws_connection_reused");
         } else if (value) {
-          s.injectionCount++; this.counts.injection_count++; s.lastInjected = this.now();
+          this.countSession(s, "injectionCount", "injection_count"); s.lastInjected = this.now();
           this.event(s, "injection", "apply", "dispatched");
         }
       },
@@ -349,13 +427,13 @@ export class TurnStateRuntime {
         // passive_observations counts ATTEMPTS (a response carried a state worth
         // classifying); the outcome is split like the active path so the UI can
         // show "accepted / rejected" instead of presenting attempts as successes.
-        s.observationCount++; this.counts.passive_observations++; s.lastObserved = this.now();
+        this.countSession(s, "observationCount", "passive_observations"); s.lastObserved = this.now();
         if (candidateModel !== null) { s.lastUpstreamModel = candidateModel; s.modelMismatch = candidateModel !== s.scope.model; }
         const outcome = this.publish(s, candidate, revision, "passive", undefined, candidateModel !== null && candidateModel !== s.scope.model, candidateModel);
         // Keep the invariant accepted + rejected == observations so the two numbers
         // always reconcile, and a discarded stale observation still counts as "not used".
-        if (outcome.accepted) this.counts.passive_accepted++;
-        else this.counts.passive_rejected++;
+        if (outcome.accepted) this.bump("passive_accepted");
+        else this.bump("passive_rejected");
       },
     };
   }
@@ -457,10 +535,24 @@ export class TurnStateRuntime {
       observed_blocks: null, expected_blocks: null, upstream_model: null, verdict: null, route_id: scope.routeId, usage: null });
     if (this.ticketEvents.length > 100) this.ticketEvents.shift();
   }
-  /** Publish a ticket decision; `counter` bumps the summary counter when the decision is one. */
+  /**
+   * Publish a ticket decision; `counter` bumps the summary counter when the decision is one.
+   *
+   * The ticket layer is a collection mechanism, so its outcome is also the scope's most recent
+   * collection result: recording it on the session is what lets the status card show a ticket
+   * failure instead of an empty "last probe" measured only from the passive path.
+   */
   private ticketOutcome(scope: Scope, action: string, reason: string, counter: TicketCounter | null): void {
     if (counter !== null) this.ticketCounts[counter]++;
     this.ticketEvent(scope, action, reason);
+    const s = this.sessions.get(keyOf(scope));
+    if (s && this.current(s)) {
+      s.lastObserved = this.now();
+      s.lastResult = reason;
+      if (action === "accept" && reason === "ticket_verified") s.lastFailure = null;
+      else if (action === "reject" || action === "harvest") s.lastFailure = { code: reason, reason: null, verdict: null, observed_blocks: null, expected_blocks: null };
+    }
+    this.persistSoon();
   }
   /**
    * One active collection round: a synthetic request over the dedicated egress when one is set,
@@ -511,6 +603,7 @@ export class TurnStateRuntime {
       return "ticket_revalidation_failed";
     }
     this.ticketCounts.ticket_revalidation_attempts++;
+    this.persistSoon();
     const revalidate = this.revalidateTransport;
     // No business-route transport means no revalidation evidence: the stored decision stands.
     if (!revalidate) return "ticket_unverified";
@@ -548,6 +641,9 @@ export class TurnStateRuntime {
     this.ticketControllers.set(key, controller);
     const timeout = setTimeout(() => controller.abort(), this.config.probe_timeout_seconds * 1000);
     this.ticketRunning++;
+    // A round that got past every guard is one collection attempt, whatever it dispatches inside.
+    this.counts.active_attempts++;
+    this.persistSoon();
     // Ticket rounds spend the same hard 6/hour/account dispatch budget as active probing:
     // every real harvest or revalidation dispatch is a real upstream request. A round that
     // ran out of budget reports `budget_exhausted` rather than an ambiguous transport failure.
@@ -560,9 +656,28 @@ export class TurnStateRuntime {
     const round = run(scope, controller.signal, reserve)
       .then(result => denied ? "budget_exhausted" : result)
       .catch(() => denied ? "budget_exhausted" : "transport_error")
+      .then(code => this.settleTicketRound(code))
       .finally(() => { clearTimeout(timeout); this.ticketRunning--; this.ticketControllers.delete(key); this.ticketRounds.delete(key); });
     this.ticketRounds.set(key, round);
     return round;
+  }
+  /**
+   * Settle one generic probe outcome. The generic-only legacy counters and the merged active
+   * counters move together, so the UI's combined figure never drifts from the split one.
+   */
+  private countProbeOutcome(accepted: boolean): void {
+    this.bump(accepted ? "accepted_probes" : "rejected_probes");
+    this.bump(accepted ? "active_accepted" : "active_rejected");
+  }
+  /**
+   * Settle one counted collection round. Exactly one of accepted/rejected is raised per attempt,
+   * which is what keeps `active_attempts === active_accepted + active_rejected` true by construction.
+   */
+  private settleTicketRound(code: string): string {
+    if (code === "ticket_verified") { this.ticketCounts.ticket_verified++; this.counts.active_accepted++; }
+    else this.counts.active_rejected++;
+    this.persistSoon();
+    return code;
   }
   /**
    * Refresh verified tickets at the generic refresh boundary, and re-harvest a ticket a single
@@ -686,7 +801,7 @@ export class TurnStateRuntime {
       return false;
     }
     s.nextProbe = Math.max(s.nextProbe, this.now() + this.config.cooldown_seconds * 1000);
-    s.probeCount++; this.counts.active_probes++;
+    this.countSession(s, "probeCount", "active_probes"); this.counts.active_attempts++; this.persistSoon();
     this.event(s, "active", "probe", "dispatched");
     return true;
   }
@@ -749,7 +864,7 @@ export class TurnStateRuntime {
               this.now() + Math.max(config.cooldown_seconds, result.retryAfter ?? 0) * 1000);
             this.guards.set(entryId, guard);
             resultCode = auth ? "auth_blocked" : "quota_blocked";
-            this.counts.rejected_probes++;
+            this.countProbeOutcome(false);
             this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: null, observed_blocks: null, expected_blocks: null });
             this.event(s, "active", "reject", resultCode, null, result.usage);
             break;
@@ -784,8 +899,8 @@ export class TurnStateRuntime {
             // `model_unknown` is still an accepted observation, so it must not look like a failure.
             if (resultCode === "model_unknown") this.outcome(s, resultCode, null);
           }
-          if (accepted) { this.counts.accepted_probes++; break; }
-          this.counts.rejected_probes++;
+          if (accepted) { this.countProbeOutcome(true); break; }
+          this.countProbeOutcome(false);
           if (!published) {
             this.outcome(s, resultCode, { code: resultCode, reason: result.stateCheck?.reason ?? null,
               verdict: result.stateCheck?.verdict ?? null, observed_blocks: result.stateCheck?.observedBlocks ?? null,
@@ -796,7 +911,7 @@ export class TurnStateRuntime {
           }
         } catch {
           resultCode = controller.signal.aborted ? "cancelled" : "transport_error";
-          if (reserved) this.counts.rejected_probes++;
+          if (reserved) this.countProbeOutcome(false);
           this.outcome(s, resultCode, { code: resultCode, reason: null, verdict: null, observed_blocks: null, expected_blocks: null });
           this.event(s, "active", "reject", resultCode);
         } finally { clearTimeout(timeout); }
@@ -888,6 +1003,7 @@ export class TurnStateRuntime {
     }
   }
   overview() {
+    this.hydrate();
     // Pure route inspection: unsupported assignments never invoke the round-robin selector.
     for (const s of [...this.sessions.values()]) {
       const scope = this.resolve?.(s.scope.entryId, s.scope.model);
@@ -897,30 +1013,84 @@ export class TurnStateRuntime {
       usable: this.usable(s), length: s.length, blocks: s.blocks, fingerprint: s.fingerprint,
       issued_at: iso(s.issued)!, expires_at: iso(s.expires)!, route_id: routeId, version: s.version,
     } : null;
-    const sessions = [...this.sessions.values()].filter(s => this.current(s)).map(s => {
+    const sessions: Record<string, unknown>[] = [];
+    // A ticket outlives the process that collected it, so a restart would otherwise report every
+    // scope as "empty" while a verified state sits on disk. Index what the ticket store can prove
+    // first: a RAM session that exists but holds no state (a dispatch/collection attempt with
+    // nothing accepted yet) must not mask a ready state either. Read-only throughout: no
+    // collection, no selector advance, and the ticket is only ever read.
+    const tickets = new Map<string, Record<string, unknown>>();
+    for (const view of ticketStore.list(this.now())) {
+      if (view.state !== "verified" || view.expires_at === null) continue;
+      if (Date.parse(view.expires_at) - this.now() <= TICKET_EXPIRY_MARGIN_MS) continue;
+      const row = this.ticketSessionDto(view, keyOf({ entryId: view.entry_id, model: view.model }));
+      if (row) tickets.set(keyOf({ entryId: view.entry_id, model: view.model }), row);
+    }
+    for (const s of this.sessions.values()) {
+      if (!this.current(s)) continue;
       this.promote(s);
-      const guard = this.guards.get(s.scope.entryId);
-      const blocked = guard && ((guard.identity === s.scope.credential && guard.blocked) || guard.until > this.now());
+      const key = keyOf(s.scope);
       const active = stateDto(s.active, s.scope.routeId), ready = stateDto(s.ready, s.scope.routeId);
-      return { entry_id: s.scope.entryId, account_label: s.scope.label == null ? null : Array.from(s.scope.label.replace(/[\r\n\0]/g, " ")).slice(0, 64).join(""), model: s.scope.model,
-        account_mode: s.scope.plan, plan_provenance: s.scope.provenance,
-        phase: s.stopped ? "paused" : s.scope.unsupported ? "unsupported" : s.task ? "collecting" : blocked ? "blocked" : active?.usable ? "usable" : active ? "expired" : "empty",
-        active, ready, injection_count: s.injectionCount, observation_count: s.observationCount, probe_count: s.probeCount,
-        ws_connection_reused: s.reusedCount, strikes: s.failures, diagnostic: s.diagnostic,
-        excluded: isProbeExcluded(s.scope.model),
-        last_upstream_model: s.lastUpstreamModel, model_mismatch: s.modelMismatch,
-        last_result: s.lastResult, last_failure: s.lastFailure ? { ...s.lastFailure } : null,
-        last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
-    });
+      const ticket = active === null ? tickets.get(key) : undefined;
+      sessions.push(this.sessionDto(s, active ?? (ticket?.active as StateDto | null) ?? null, ready));
+      tickets.delete(key);
+    }
+    // Whatever the in-memory sessions did not already cover belongs to a previous process.
+    for (const row of tickets.values()) sessions.push(this.sessionDto(null, row.active as StateDto | null, null, row));
     return { schema: "codex-proxy.turn-state-overview.v1" as const, server_time: iso(this.now())!, epoch: this.epoch,
-      config: { ...this.config, harvest_proxy_url: maskProxyUrl(this.config.harvest_proxy_url) }, summary: { sessions: sessions.length, usable: sessions.filter(s => s.active?.usable).length,
-        ready: sessions.filter(s => s.ready?.usable).length, collecting: sessions.filter(s => s.phase === "collecting").length,
+      config: { ...this.config, harvest_proxy_url: maskProxyUrl(this.config.harvest_proxy_url) }, summary: { sessions: sessions.length, usable: sessions.filter(s => (s.active as StateDto | null)?.usable).length,
+        ready: sessions.filter(s => (s.ready as StateDto | null)?.usable).length, collecting: sessions.filter(s => s.phase === "collecting").length,
         expired: sessions.filter(s => s.phase === "expired").length, blocked: sessions.filter(s => s.phase === "blocked" || s.phase === "paused").length,
+        since: this.metrics.epoch() || null,
         ...this.counts, ...this.ticketCounts },
       tickets: ticketStore.list(this.now()),
       // Ticket events share the generic 200-event cap: the merged list is truncated to the
       // newest 200 so the emitted snapshot always satisfies the frozen Keeper contract.
       sessions, events: [...this.events, ...this.ticketEvents].slice(-200).map(e => ({ ...e })) };
   }
+  /**
+   * The overview row for one scope. `s` is the live session when there is one; `persisted` carries
+   * the ticket-derived fields for a scope only the store knows about. A scope with a verified
+   * ticket but no in-memory session reports as a ready state, which is what the ticket is for.
+   */
+  private sessionDto(s: Session | null, active: StateDto | null, ready: StateDto | null, persisted?: Record<string, unknown>): Record<string, unknown> {
+    if (!s) return { ...(persisted as Record<string, unknown>), active, ready: null,
+      phase: active?.usable ? "usable" : "expired" };
+    const guard = this.guards.get(s.scope.entryId);
+    const blocked = guard && ((guard.identity === s.scope.credential && guard.blocked) || guard.until > this.now());
+    return { entry_id: s.scope.entryId, account_label: s.scope.label == null ? null : Array.from(s.scope.label.replace(/[\r\n\0]/g, " ")).slice(0, 64).join(""), model: s.scope.model,
+      account_mode: s.scope.plan, plan_provenance: s.scope.provenance,
+      phase: s.stopped ? "paused" : s.scope.unsupported ? "unsupported" : s.task ? "collecting" : blocked ? "blocked" : active?.usable ? "usable" : active ? "expired" : "empty",
+      active, ready, injection_count: s.injectionCount, observation_count: s.observationCount, probe_count: s.probeCount,
+      ws_connection_reused: s.reusedCount, strikes: s.failures, diagnostic: s.diagnostic,
+      excluded: isProbeExcluded(s.scope.model),
+      last_upstream_model: s.lastUpstreamModel, model_mismatch: s.modelMismatch,
+      last_result: s.lastResult, last_failure: s.lastFailure ? { ...s.lastFailure } : null,
+      last_observed_at: iso(s.lastObserved), last_injected_at: iso(s.lastInjected), next_probe_at: s.nextProbe ? iso(s.nextProbe) : null };
+  }
+  /**
+   * The fields a persisted verified ticket can prove without a live session, plus the `active`
+   * summary built from the stored state. The fingerprint is the state's own digest, the same value
+   * the live path reports, so Keeper's `^[a-f0-9]{8,32}$` contract holds; the raw value never leaves
+   * this function. Returns null when the record cannot be read, so a partial row is never emitted.
+   */
+  private ticketSessionDto(view: { entry_id: string; model: string; route_id: string; length: number | null; issued_at: string | null; expires_at: string | null; uses: number; used_at: string | null }, key: string): Record<string, unknown> | null {
+    const record = ticketStore.get(view.entry_id, view.model);
+    if (!record || typeof record.value !== "string" || record.value === "" || view.expires_at === null) return null;
+    const scope = this.resolve?.(view.entry_id, view.model);
+    const totals = this.sessionTotals[key] ?? {};
+    const total = (name: string): number => Math.max(0, Math.trunc(totals[name] ?? 0));
+    const active: StateDto = { usable: true, length: record.value.length, blocks: planBlocks(scope?.plan ?? "personal"),
+      fingerprint: digest(record.value).slice(0, 16), issued_at: view.issued_at ?? iso(this.now())!, expires_at: view.expires_at,
+      route_id: view.route_id || null, version: 0 };
+    return { entry_id: view.entry_id, account_label: scope?.label ?? null, model: view.model,
+      account_mode: scope?.plan ?? "personal", plan_provenance: scope?.provenance ?? "assumed_personal",
+      injection_count: total("injection_count"), observation_count: total("observation_count"), probe_count: total("probe_count"),
+      ws_connection_reused: total("ws_connection_reused"), strikes: 0, diagnostic: null,
+      excluded: isProbeExcluded(view.model),
+      last_upstream_model: null, model_mismatch: false, last_result: null, last_failure: null,
+      last_observed_at: null, last_injected_at: view.used_at, next_probe_at: null, active };
+  }
 }
-export const turnStateRuntime = new TurnStateRuntime();
+/** The process-wide runtime persists its cumulative totals; throwaway test runtimes stay in memory. */
+export const turnStateRuntime = new TurnStateRuntime(Date.now, new MetricsStore(() => resolve(getDataDir(), "turn-state-metrics.json")));

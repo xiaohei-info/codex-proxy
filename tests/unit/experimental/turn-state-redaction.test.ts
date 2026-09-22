@@ -5,6 +5,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); append.mockClear(); });
 it("debug dumps withhold arbitrary split chunks while active and redact structured requests", async () => {
   vi.stubEnv("CODEX_PROXY_DEBUG_DUMP", "1");
   const { turnStateRuntime: runtime } = await import("@src/experimental/turn-state/runtime.js");
+  runtime.redirectMetrics();
   const { debugDump } = await import("@src/utils/debug-dump.js");
   runtime.update({ enabled: true, mode: "observe" });
   debugDump("upstream-chunk", { chunk: 'data: {"x-codex-turn-st' });
